@@ -84,6 +84,9 @@ pub struct Sps {
     /// VUI timing info: when set, frames are emitted at a fixed rate of
     /// `time_scale / (2 * num_units_in_tick)`.
     pub fixed_frame_rate_flag: bool,
+    /// VUI bitstream restriction: the most frames that precede any frame in decoding order and follow it in
+    /// output order. `None` when the stream does not say.
+    pub max_num_reorder_frames: Option<u32>,
 }
 
 impl Sps {
@@ -287,6 +290,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
     let mut num_units_in_tick: Option<u32> = None;
     let mut time_scale: Option<u32> = None;
     let mut fixed_frame_rate_flag = false;
+    let mut max_num_reorder_frames = None;
     if vui_parameters_present_flag {
         // Parse just enough of the VUI to extract timing info (spec E.1.1).
         // We read the early optional sub-flags so we can reach
@@ -332,8 +336,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
             time_scale = Some((hi << 16) | lo);
             fixed_frame_rate_flag = r.read_bit()? != 0;
         }
-        // The remaining VUI fields (HRD, bitstream_restriction, etc.) are
-        // not used by this decoder, so we stop parsing here.
+        // HRD and bitstream restriction (spec E.1.1): the reorder depth bounds display latency. A malformed
+        // tail leaves it unknown rather than failing an otherwise usable SPS.
+        max_num_reorder_frames = vui_reorder_frames(&mut r).ok().flatten();
     }
 
     Ok(Sps {
@@ -378,7 +383,54 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
         num_units_in_tick,
         time_scale,
         fixed_frame_rate_flag,
+        max_num_reorder_frames,
     })
+}
+
+/// The VUI after timing info (spec E.1.1): skip both HRD sets, then read max_num_reorder_frames from the
+/// bitstream restriction, when present.
+fn vui_reorder_frames(r: &mut BitstreamReader) -> Result<Option<u32>, &'static str> {
+    let nal_hrd = r.read_bit()? != 0;
+    if nal_hrd {
+        skip_hrd_parameters(r)?;
+    }
+    let vcl_hrd = r.read_bit()? != 0;
+    if vcl_hrd {
+        skip_hrd_parameters(r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.read_bit()?; // low_delay_hrd_flag
+    }
+    r.read_bit()?; // pic_struct_present_flag
+    if r.read_bit()? == 0 {
+        return Ok(None); // no bitstream_restriction
+    }
+    r.read_bit()?; // motion_vectors_over_pic_boundaries_flag
+    for _ in 0..4 {
+        // max_bytes_per_pic_denom, max_bits_per_mb_denom, log2_max_mv_length_horizontal and _vertical
+        r.read_ue()?;
+    }
+    let reorder = r.read_ue()?;
+    r.read_ue()?; // max_dec_frame_buffering
+    Ok((reorder <= 16).then_some(reorder))
+}
+
+/// hrd_parameters (spec E.1.2), read only to reach the fields after it.
+fn skip_hrd_parameters(r: &mut BitstreamReader) -> Result<(), &'static str> {
+    let cpb_cnt = r.read_ue()? + 1;
+    if cpb_cnt > 32 {
+        return Err("cpb_cnt_minus1 out of range");
+    }
+    r.read_bits(8)?; // bit_rate_scale and cpb_size_scale
+    for _ in 0..cpb_cnt {
+        r.read_ue()?; // bit_rate_value_minus1
+        r.read_ue()?; // cpb_size_value_minus1
+        r.read_bit()?; // cbr_flag
+    }
+    // initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
+    // dpb_output_delay_length_minus1, time_offset_length
+    r.read_bits(20)?;
+    Ok(())
 }
 
 /// Parse a scaling list from the bitstream (H.264 spec 7.3.2.1.1).
@@ -517,6 +569,7 @@ mod tests {
             num_units_in_tick: None,
             time_scale: None,
             fixed_frame_rate_flag: false,
+            max_num_reorder_frames: None,
         };
         assert!(sps.frame_rate().is_none());
         assert!(sps.frame_rate_f64().is_none());

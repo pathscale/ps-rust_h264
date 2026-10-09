@@ -141,6 +141,9 @@ pub struct Decoder {
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
     pending_field: Option<Frame>,
+    /// Display reorder depth the latest SPS promises: 0 for POC type 2 (output order is decode order), else
+    /// its VUI max_num_reorder_frames. `None` when the stream does not say.
+    reorder_depth: Option<usize>,
 }
 
 impl Default for Decoder {
@@ -158,6 +161,7 @@ impl Decoder {
             dpb: Dpb::new(0),
             pending: None,
             pending_field: None,
+            reorder_depth: None,
         }
     }
 
@@ -179,6 +183,11 @@ impl Decoder {
             NalUnitType::Sps => {
                 let sps = parse_sps(&nal.rbsp)?;
                 self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
+                self.reorder_depth = if sps.pic_order_cnt_type == 2 {
+                    Some(0)
+                } else {
+                    sps.max_num_reorder_frames.map(|frames| frames as usize)
+                };
                 self.sps_table.insert(sps.seq_parameter_set_id, sps);
                 Ok(None)
             }
@@ -1124,8 +1133,12 @@ impl OrderedDecoder {
             self.drain_completed_gops(&mut output);
         }
 
-        // Bound buffer depth to limit reorder latency.
-        while self.buffer.len() > self.max_depth {
+        // Bound buffer depth to limit reorder latency; a stream that declares its reorder depth needs no more.
+        let depth = self
+            .inner
+            .reorder_depth
+            .map_or(self.max_depth, |depth| depth.min(self.max_depth));
+        while self.buffer.len() > depth {
             output.push(self.pop_lowest()?);
         }
 

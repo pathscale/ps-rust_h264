@@ -44,7 +44,7 @@
 //! frames in display order, sort by `pic_order_cnt` within each GOP.
 //!
 //! Note that `decode_nal` returns the *previous* picture when it sees a new
-//! one, so be careful about IDR boundary tracking — increment your GOP
+//! one, so be careful about IDR boundary tracking: increment your GOP
 //! counter **after** the call, not before. See `examples/dump_frames.rs` and
 //! `examples/play.rs` for working patterns.
 //!
@@ -93,6 +93,7 @@ pub mod slice;
 mod slice;
 
 mod slice_context;
+mod slice_setup;
 
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]

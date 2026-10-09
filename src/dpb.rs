@@ -3,8 +3,9 @@
 //! Stores decoded reference frames for use by P/B slice motion compensation.
 //! Manages short-term reference marking via sliding window (spec 8.2.5.3).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
+use crate::error::DecodeError;
 use crate::nal::NalUnitType;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
@@ -28,7 +29,7 @@ pub enum PictureStructure {
     BottomField,
 }
 
-/// Immutable decoded picture data shared via Rc.
+/// Immutable decoded picture data shared via Arc.
 #[derive(Debug)]
 pub struct DecodedPicture {
     pub y: Vec<u8>,
@@ -56,9 +57,9 @@ pub struct DecodedPicture {
     pub structure: PictureStructure,
 }
 
-/// A DPB entry wrapping an Rc<DecodedPicture> with mutable status.
+/// A DPB entry wrapping an Arc<DecodedPicture> with mutable status.
 struct DpbEntry {
-    pic: Rc<DecodedPicture>,
+    pic: Arc<DecodedPicture>,
     reference: ReferenceStatus,
 }
 
@@ -95,7 +96,7 @@ impl Dpb {
 
     /// Insert a decoded picture into the DPB.
     /// Applies sliding window marking if needed (spec 8.2.5.3).
-    pub fn insert(&mut self, pic: Rc<DecodedPicture>, reference: ReferenceStatus) {
+    pub fn insert(&mut self, pic: Arc<DecodedPicture>, reference: ReferenceStatus) {
         // Sliding window only applies to short-term references (spec 8.2.5.3)
         if reference == ReferenceStatus::ShortTerm {
             // Don't evict the complementary field of the picture being inserted.
@@ -128,7 +129,7 @@ impl Dpb {
         &self,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
@@ -170,7 +171,7 @@ impl Dpb {
         current_poc: i32,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -213,7 +214,7 @@ impl Dpb {
         current_poc: i32,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) -> Vec<Rc<DecodedPicture>> {
+    ) -> Vec<Arc<DecodedPicture>> {
         let short_term: Vec<_> = self
             .entries
             .iter()
@@ -262,7 +263,7 @@ impl Dpb {
 
     /// For field pictures: within runs of entries sharing the same frame_num,
     /// put same-parity fields before opposite-parity (spec 8.2.4.2.5).
-    fn field_parity_interleave(list: &mut [Rc<DecodedPicture>], bottom_field_flag: bool) {
+    fn field_parity_interleave(list: &mut [Arc<DecodedPicture>], bottom_field_flag: bool) {
         let mut i = 0;
         while i < list.len() {
             let fn_val = list[i].frame_num;
@@ -291,15 +292,20 @@ impl Dpb {
     /// `is_field_pic`: true for field pictures (PicNum = 2*frame_num + parity_bit)
     /// `bottom_field_flag`: current field parity (only meaningful when is_field_pic)
     pub fn apply_ref_list_modification(
-        ref_list: &mut Vec<Rc<DecodedPicture>>,
+        ref_list: &mut Vec<Arc<DecodedPicture>>,
         ops: &[(u32, u32)],
         curr_pic_num: u32,
         max_pic_num: u32,
         is_field_pic: bool,
         bottom_field_flag: bool,
-    ) {
-        if ops.is_empty() || ref_list.is_empty() {
-            return;
+    ) -> Result<(), DecodeError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        if ref_list.is_empty() || max_pic_num == 0 {
+            return Err(DecodeError::InvalidSyntax(
+                "invalid reference modification list",
+            ));
         }
         let num_active = ref_list.len();
         let mut pred_pic_num = curr_pic_num;
@@ -310,7 +316,9 @@ impl Dpb {
             // A malformed bitstream may encode more RPLM commands than there
             // are slots — bail out instead of indexing out of bounds.
             if ref_idx_lx >= num_active {
-                return;
+                return Err(DecodeError::InvalidSyntax(
+                    "too many reference modifications",
+                ));
             }
             if idc == 2 {
                 // Long-term ref reordering (spec 8.2.4.3.2)
@@ -324,7 +332,11 @@ impl Dpb {
                     p.frame_num == long_term_pic_num
                 }) {
                     let pic = ref_list[found_pos].clone();
-                    ref_list.push(ref_list.last().unwrap().clone());
+                    let last = ref_list
+                        .last()
+                        .cloned()
+                        .ok_or(DecodeError::InvalidSyntax("empty reference list"))?;
+                    ref_list.push(last);
                     let end = ref_list.len() - 1;
                     for c in (ref_idx_lx + 1..=end).rev() {
                         ref_list[c] = ref_list[c - 1].clone();
@@ -333,12 +345,14 @@ impl Dpb {
                     // Remove duplicate: entries after ref_idx_lx with same pic
                     let mut n = ref_idx_lx + 1;
                     for c in (ref_idx_lx + 1)..ref_list.len() {
-                        if !Rc::ptr_eq(&ref_list[c], &pic) {
+                        if !Arc::ptr_eq(&ref_list[c], &pic) {
                             ref_list[n] = ref_list[c].clone();
                             n += 1;
                         }
                     }
                     ref_list.truncate(num_active);
+                } else {
+                    return Err(DecodeError::InvalidSyntax("missing long-term reference"));
                 }
                 ref_idx_lx += 1;
                 continue;
@@ -346,7 +360,9 @@ impl Dpb {
             if idc > 1 {
                 continue; // idc=3 terminates the loop (handled by caller)
             }
-            let abs_diff = val + 1;
+            let abs_diff = val.checked_add(1).ok_or(DecodeError::InvalidSyntax(
+                "reference picture difference overflow",
+            ))?;
             // Spec 8.2.4.3.1: modular arithmetic on pic_num. Use wrapping
             // ops to handle malformed streams where abs_diff exceeds the
             // valid range without panicking.
@@ -386,7 +402,11 @@ impl Dpb {
 
                 // Shift right: make room at ref_idx_lx
                 // Temporarily grow the list by 1
-                ref_list.push(ref_list.last().unwrap().clone());
+                let last = ref_list
+                    .last()
+                    .cloned()
+                    .ok_or(DecodeError::InvalidSyntax("empty reference list"))?;
+                ref_list.push(last);
                 let end = ref_list.len() - 1;
                 for c in (ref_idx_lx + 1..=end).rev() {
                     ref_list[c] = ref_list[c - 1].clone();
@@ -403,10 +423,13 @@ impl Dpb {
                     }
                 }
                 ref_list.truncate(num_active);
+            } else {
+                return Err(DecodeError::InvalidSyntax("missing short-term reference"));
             }
 
             ref_idx_lx += 1;
         }
+        Ok(())
     }
 
     /// Compute Picture Order Count for the current picture (spec 8.2.1).
@@ -689,7 +712,7 @@ impl Dpb {
 
     /// Get list of long-term reference pictures, sorted by ascending long_term_frame_idx.
     /// Used to append to reference lists after short-term refs (spec 8.2.4.2.1, 8.2.4.2.3).
-    pub fn long_term_ref_list(&self) -> Vec<Rc<DecodedPicture>> {
+    pub fn long_term_ref_list(&self) -> Vec<Arc<DecodedPicture>> {
         let mut refs: Vec<_> = self
             .entries
             .iter()
@@ -713,8 +736,8 @@ impl Dpb {
 mod tests {
     use super::*;
 
-    fn make_pic(frame_num: u32, poc: i32) -> Rc<DecodedPicture> {
-        Rc::new(DecodedPicture {
+    fn make_pic(frame_num: u32, poc: i32) -> Arc<DecodedPicture> {
+        Arc::new(DecodedPicture {
             y: vec![],
             u: vec![],
             v: vec![],
@@ -845,6 +868,6 @@ mod tests {
         // With val=0 → abs_diff=1 → pic_num = pred - 1
         let ops: Vec<(u32, u32)> = (0..10).map(|_| (0u32, 0u32)).collect();
         // This must not panic
-        Dpb::apply_ref_list_modification(&mut ref_list, &ops, 5, 16, false, false);
+        let _ = Dpb::apply_ref_list_modification(&mut ref_list, &ops, 5, 16, false, false);
     }
 }

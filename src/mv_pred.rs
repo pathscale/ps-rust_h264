@@ -3,9 +3,10 @@
 //! Contains MV prediction (median, directional), spatial/temporal direct mode,
 //! MV neighbor lookups, skip MV derivation, and weighted prediction context.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::dpb::DecodedPicture;
+use crate::error::DecodeError;
 use crate::inter_pred;
 use crate::residual::OFFSET_TO_BLOCK;
 use crate::slice::PredWeightTable;
@@ -127,7 +128,7 @@ pub(crate) fn predict_mv_sub(
 /// Safely index a ref pic list, clamping out-of-range indices to the last entry.
 /// Returns `None` if the list is empty (malformed bitstream).
 #[inline]
-pub(crate) fn ref_pic_safe(list: &[Rc<DecodedPicture>], idx: i8) -> Option<&Rc<DecodedPicture>> {
+pub(crate) fn ref_pic_safe(list: &[Arc<DecodedPicture>], idx: i8) -> Option<&Arc<DecodedPicture>> {
     if list.is_empty() {
         return None;
     }
@@ -529,14 +530,14 @@ pub(crate) fn derive_spatial_direct_blk(
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn derive_temporal_direct_blk(
     col_pic: &DecodedPicture,
-    ref_pic_list_l0: &[Rc<DecodedPicture>],
+    ref_pic_list_l0: &[Arc<DecodedPicture>],
     current_poc: i32,
     col_poc: i32,
     mb_idx: usize,
     blk: usize,
     direct_8x8_inference_flag: bool,
     _mctx: MbaffCtx,
-) -> ([i16; 2], [i16; 2], i8, i8, bool, bool) {
+) -> Result<([i16; 2], [i16; 2], i8, i8, bool, bool), DecodeError> {
     // When direct_8x8_inference_flag is set (spec 8.4.1.2.3), use ONE co-located
     // MV per 8x8 block. Per spec, the co-located partition is derived using the
     // MV at luma4x4BlkIdx = (x8*3, y8*3) in 4x4-block raster coordinates within
@@ -557,26 +558,41 @@ pub(crate) fn derive_temporal_direct_blk(
         || col_pic.ref_idx_l0[col_base + col_blk] < 0
     {
         // Intra co-located: zero MVs, ref_idx=0
-        return ([0, 0], [0, 0], 0, 0, true, true);
+        return Ok(([0, 0], [0, 0], 0, 0, true, true));
     }
 
     // Get co-located MV and ref_idx
-    let col_mv = col_pic.mv_l0[col_base + col_blk];
+    let col_mv = *col_pic
+        .mv_l0
+        .get(col_base + col_blk)
+        .ok_or(DecodeError::InvalidSyntax(
+            "missing co-located motion vector",
+        ))?;
     let _col_ref_idx = col_pic.ref_idx_l0[col_base + col_blk];
 
     // Map co-located ref_idx to current L0 ref_idx by matching POC (spec 8.4.1.2.3).
     // Look up the POC that the co-located picture referenced at col_ref_idx.
-    let col_ref_poc_val = col_pic.ref_poc_l0[col_base + col_blk];
+    let col_ref_poc_val =
+        *col_pic
+            .ref_poc_l0
+            .get(col_base + col_blk)
+            .ok_or(DecodeError::InvalidSyntax(
+                "missing co-located reference POC",
+            ))?;
 
     // Find the entry in our current L0 list with the matching POC.
     let ref0 = ref_pic_list_l0
         .iter()
         .position(|p| p.pic_order_cnt == col_ref_poc_val)
-        .unwrap_or(0);
+        .ok_or(DecodeError::InvalidSyntax(
+            "missing temporal direct reference",
+        ))?;
     let poc0 = ref_pic_list_l0
         .get(ref0)
-        .map(|p| p.pic_order_cnt)
-        .unwrap_or(0);
+        .ok_or(DecodeError::InvalidSyntax(
+            "invalid temporal direct reference",
+        ))?
+        .pic_order_cnt;
 
     // Compute dist_scale_factor: td = col_poc - poc0, tb = current_poc - poc0
     let td = (col_poc - poc0).clamp(-128, 127);
@@ -595,7 +611,7 @@ pub(crate) fn derive_temporal_direct_blk(
         ([mx_l0, my_l0], [mx_l1, my_l1])
     };
 
-    (mv_l0, mv_l1, ref0 as i8, 0, true, true)
+    Ok((mv_l0, mv_l1, ref0 as i8, 0, true, true))
 }
 
 /// Motion vector prediction using the median of neighbors A, B, C (spec 8.4.1.3).

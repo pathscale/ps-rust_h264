@@ -4,7 +4,7 @@
 //! every MB decoder (CABAC/CAVLC, I/P/B) reads and writes. Extracting it
 //! from `decode_slice` enables splitting MB decode logic into methods.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::decoder::Frame;
 
@@ -25,9 +25,9 @@ pub(crate) struct SliceParams<'a> {
     pub scaling_list_8x8: &'a [[u8; 64]; 2],
     pub constrained_intra_pred_flag: bool,
     pub chroma_qp_index_offset: i32,
-    pub ref_pic_list: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l0: &'a [Rc<DecodedPicture>],
-    pub ref_pic_list_l1: &'a [Rc<DecodedPicture>],
+    pub ref_pic_list: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l0: &'a [Arc<DecodedPicture>],
+    pub ref_pic_list_l1: &'a [Arc<DecodedPicture>],
     pub num_ref_idx_l0_active: u32,
     pub num_ref_idx_l1_active: u32,
     pub wctx: &'a WeightContext<'a>,
@@ -479,7 +479,7 @@ impl SliceContext<'_> {
         blk_start: usize,
         blk_count: usize,
         sp: &SliceParams,
-    ) {
+    ) -> Result<(), crate::error::DecodeError> {
         let direct_spatial = sp.direct_spatial_mv_pred_flag;
         let direct_8x8_inference_flag = sp.direct_8x8_inference_flag;
         let current_poc = sp.current_poc;
@@ -573,9 +573,12 @@ impl SliceContext<'_> {
                 }
             }
         } else {
-            let Some(col_pic) = ref_pic_list_l1.first() else {
-                return; // malformed: temporal direct requires L1 ref list
-            };
+            let col_pic =
+                ref_pic_list_l1
+                    .first()
+                    .ok_or(crate::error::DecodeError::InvalidSyntax(
+                        "temporal direct requires an L1 reference",
+                    ))?;
             if direct_8x8_inference_flag && blk_count == 4 {
                 let first_blk = blk_start;
                 let (mv_l0, mv_l1, ri_l0, ri_l1, _, _) = derive_temporal_direct_blk(
@@ -590,7 +593,7 @@ impl SliceContext<'_> {
                         mbaff: self.mbaff,
                         mb_field_decoding: self.mb_field_decoding,
                     },
-                );
+                )?;
                 let base = mb_idx * 16;
                 for blk in blk_start..blk_start + 4 {
                     self.mv_store_l0[base + blk] = mv_l0;
@@ -614,7 +617,7 @@ impl SliceContext<'_> {
                             mbaff: self.mbaff,
                             mb_field_decoding: self.mb_field_decoding,
                         },
-                    );
+                    )?;
                     for blk in first_blk..first_blk + 4 {
                         self.mv_store_l0[base + blk] = mv_l0;
                         self.ref_idx_store_l0[base + blk] = ri_l0;
@@ -636,7 +639,7 @@ impl SliceContext<'_> {
                             mbaff: self.mbaff,
                             mb_field_decoding: self.mb_field_decoding,
                         },
-                    );
+                    )?;
                     self.mv_store_l0[mb_idx * 16 + blk] = mv_l0;
                     self.ref_idx_store_l0[mb_idx * 16 + blk] = ri_l0;
                     self.mv_store_l1[mb_idx * 16 + blk] = mv_l1;
@@ -644,10 +647,9 @@ impl SliceContext<'_> {
                 }
             }
         }
+        Ok(())
     }
 
-    /// Decode a B-slice skip macroblock: spatial/temporal direct MV derivation,
-    /// per-4x4-block MC (luma + chroma), no residual.
     /// Decode a B-slice skip macroblock: spatial/temporal direct MV derivation,
     /// per-4x4-block MC (luma + chroma), no residual.
     pub(crate) fn decode_b_skip_mb(
@@ -656,13 +658,13 @@ impl SliceContext<'_> {
         mb_x: usize,
         mb_y: usize,
         sp: &SliceParams,
-    ) {
+    ) -> Result<(), crate::error::DecodeError> {
         let ref_pic_list_l0 = sp.ref_pic_list_l0;
         let ref_pic_list_l1 = sp.ref_pic_list_l1;
         let wctx = sp.wctx;
         let use_weight = sp.use_weight;
         // Derive MVs per 4x4 block via spatial or temporal direct mode
-        self.derive_direct_mvs(mb_idx, 0, 16, sp);
+        self.derive_direct_mvs(mb_idx, 0, 16, sp)?;
 
         // Luma MC: per-4x4-block
         let mut luma_pred = [0u8; 256];
@@ -678,12 +680,12 @@ impl SliceContext<'_> {
             if bp0 && bp1 {
                 let mut p0 = [0u8; 16];
                 let mut p1 = [0u8; 16];
-                let Some(ref_l0) = ref_pic_safe(ref_pic_list_l0, r0) else {
-                    return;
-                };
-                let Some(ref_l1) = ref_pic_safe(ref_pic_list_l1, r1) else {
-                    return;
-                };
+                let ref_l0 = ref_pic_safe(ref_pic_list_l0, r0).ok_or(
+                    crate::error::DecodeError::InvalidSyntax("missing B-skip L0 reference"),
+                )?;
+                let ref_l1 = ref_pic_safe(ref_pic_list_l1, r1).ok_or(
+                    crate::error::DecodeError::InvalidSyntax("missing B-skip L1 reference"),
+                )?;
                 let (
                     mc_y_l0,
                     ref_stride_l0,
@@ -726,9 +728,9 @@ impl SliceContext<'_> {
                 );
                 wctx.apply_bi(&p0, &p1, &mut blk_pred, r0 as usize, r1 as usize, false, 0);
             } else if bp0 {
-                let Some(ref_pic) = ref_pic_safe(ref_pic_list_l0, r0) else {
-                    return;
-                };
+                let ref_pic = ref_pic_safe(ref_pic_list_l0, r0).ok_or(
+                    crate::error::DecodeError::InvalidSyntax("missing B-skip L0 reference"),
+                )?;
                 let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                     self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
                 inter_pred::luma_mc_stride(
@@ -747,9 +749,9 @@ impl SliceContext<'_> {
                     wctx.apply_uni(&mut blk_pred, 0, r0 as usize, false, 0);
                 }
             } else if bp1 {
-                let Some(ref_pic) = ref_pic_safe(ref_pic_list_l1, r1) else {
-                    return;
-                };
+                let ref_pic = ref_pic_safe(ref_pic_list_l1, r1).ok_or(
+                    crate::error::DecodeError::InvalidSyntax("missing B-skip L1 reference"),
+                )?;
                 let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                     self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
                 inter_pred::luma_mc_stride(
@@ -802,12 +804,16 @@ impl SliceContext<'_> {
                 if bp0 && bp1 {
                     let mut c0 = [0u8; 16];
                     let mut c1 = [0u8; 16];
-                    let Some(rl0) = ref_pic_safe(ref_pic_list_l0, r0) else {
-                        return;
-                    };
-                    let Some(rl1) = ref_pic_safe(ref_pic_list_l1, r1) else {
-                        return;
-                    };
+                    let rl0 = ref_pic_safe(ref_pic_list_l0, r0).ok_or(
+                        crate::error::DecodeError::InvalidSyntax(
+                            "missing B-skip chroma L0 reference",
+                        ),
+                    )?;
+                    let rl1 = ref_pic_safe(ref_pic_list_l1, r1).ok_or(
+                        crate::error::DecodeError::InvalidSyntax(
+                            "missing B-skip chroma L1 reference",
+                        ),
+                    )?;
                     let (_mc_y_l0, _rs_l0, _ref_y_off_l0, mc_cy_l0, c_ref_stride_l0, c_ref_off_l0) =
                         self.mc_params(mb_idx, mb_y, rl0.width as usize, r0);
                     let (_mc_y_l1, _rs_l1, _ref_y_off_l1, mc_cy_l1, c_ref_stride_l1, c_ref_off_l1) =
@@ -858,9 +864,11 @@ impl SliceContext<'_> {
                         plane_idx,
                     );
                 } else if bp0 {
-                    let Some(ref_pic) = ref_pic_safe(ref_pic_list_l0, r0) else {
-                        return;
-                    };
+                    let ref_pic = ref_pic_safe(ref_pic_list_l0, r0).ok_or(
+                        crate::error::DecodeError::InvalidSyntax(
+                            "missing B-skip chroma L0 reference",
+                        ),
+                    )?;
                     let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
                     let cr = if plane_idx == 0 {
@@ -885,9 +893,11 @@ impl SliceContext<'_> {
                         wctx.apply_uni(&mut cblk_pred, 0, r0 as usize, true, plane_idx);
                     }
                 } else if bp1 {
-                    let Some(ref_pic) = ref_pic_safe(ref_pic_list_l1, r1) else {
-                        return;
-                    };
+                    let ref_pic = ref_pic_safe(ref_pic_list_l1, r1).ok_or(
+                        crate::error::DecodeError::InvalidSyntax(
+                            "missing B-skip chroma L1 reference",
+                        ),
+                    )?;
                     let (_mc_y, _rs, _ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                         self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
                     let cr = if plane_idx == 0 {
@@ -933,6 +943,7 @@ impl SliceContext<'_> {
         for blk in 0..16 {
             self.blk_is_direct[mb_idx * 16 + blk] = true;
         }
+        Ok(())
     }
 
     /// Gather CABAC CBP neighbor context for a macroblock.

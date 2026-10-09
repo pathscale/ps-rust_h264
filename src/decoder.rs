@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::bitstream::BitstreamReader;
 use crate::deblock::{self, MbInfo, MbType};
@@ -10,8 +10,9 @@ use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_header, SliceType};
+use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
+use crate::slice_setup::{self, ReferenceLists};
 use crate::sps::{parse_sps, Sps};
 
 /// A decoded YUV 4:2:0 frame.
@@ -182,14 +183,14 @@ impl Decoder {
                 Ok(None)
             }
             NalUnitType::Pps => {
-                let pps_id_sps = {
-                    // Peek at seq_parameter_set_id to find the right SPS
-                    let mut peek = BitstreamReader::new(&nal.rbsp);
-                    let _ = peek.read_ue(); // pic_parameter_set_id
-                    peek.read_ue().ok()
-                };
-                let sps_ref = pps_id_sps.and_then(|id| self.sps_table.get(&id));
-                let pps = parse_pps(&nal.rbsp, sps_ref)?;
+                let mut peek = BitstreamReader::new(&nal.rbsp);
+                let _pps_id = peek.read_ue()?;
+                let sps_id = peek.read_ue()?;
+                let sps = self
+                    .sps_table
+                    .get(&sps_id)
+                    .ok_or(DecodeError::InvalidSyntax("PPS references an unknown SPS"))?;
+                let pps = parse_pps(&nal.rbsp, Some(sps))?;
                 self.pps_table.insert(pps.pic_parameter_set_id, pps);
                 Ok(None)
             }
@@ -197,7 +198,7 @@ impl Decoder {
             NalUnitType::SliceIdr | NalUnitType::Slice => {
                 // Peek at first_mb_in_slice to detect new vs continuation slice
                 let mut peek = BitstreamReader::new(&nal.rbsp);
-                let first_mb = peek.read_ue().unwrap_or(0);
+                let first_mb = peek.read_ue()?;
 
                 // Check if this is a new picture: first_mb==0 means first
                 // slice of a new picture. Continuation slices (first_mb > 0)
@@ -211,31 +212,13 @@ impl Decoder {
                     None
                 };
 
-                // Decode this slice (creates or continues PictureState).
-                // For CAVLC multi-slice, end-of-slice detection may fail,
-                // causing errors from reading past the slice boundary. If
-                // we had a pending picture, the already-decoded MBs are
-                // valid, so we treat the error as end-of-slice.
-                //
-                // Since decode_slice takes self.pending via take(), we must
-                // save a backup for continuation slices so we can restore it
-                // if the decode fails mid-slice.
-                let had_pending = !is_new_picture && self.pending.is_some();
-                let pending_backup = if had_pending {
-                    self.pending.clone()
-                } else {
-                    None
-                };
-                match self.decode_slice(nal) {
-                    Ok(()) => {}
-                    Err(_e) if self.pending.is_some() => {}
-                    Err(_e) if had_pending => {
-                        // decode_slice consumed self.pending but failed before
-                        // reassembling it. Restore the backup so already-decoded
-                        // MBs from earlier slices are preserved.
-                        self.pending = pending_backup;
-                    }
-                    Err(e) => return Err(e),
+                if let Err(error) = self.decode_slice(nal) {
+                    // A partial picture must never escape through flush or
+                    // become a reference for a subsequent decode.
+                    self.pending = None;
+                    self.pending_field = None;
+                    self.dpb.clear();
+                    return Err(error);
                 }
 
                 Ok(prev_frame)
@@ -319,8 +302,7 @@ impl Decoder {
         for &(op, param) in &ps.mmco_ops {
             match op {
                 1 => {
-                    let pic_num_to_remove =
-                        mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
+                    let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
                     self.dpb.mark_short_term_unused(pic_num_to_remove as u32);
                 }
                 2 => {
@@ -347,7 +329,7 @@ impl Decoder {
             }
         }
 
-        let pic = Rc::new(DecodedPicture {
+        let pic = Arc::new(DecodedPicture {
             y: ps.frame.y.clone(),
             u: ps.frame.u.clone(),
             v: ps.frame.v.clone(),
@@ -470,12 +452,10 @@ impl Decoder {
                 // Interleave chroma lines
                 for r in 0..ch {
                     let src_off = r * cw;
-                    u[r * 2 * cw..r * 2 * cw + cw]
-                        .copy_from_slice(&top.u[src_off..src_off + cw]);
+                    u[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.u[src_off..src_off + cw]);
                     u[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
                         .copy_from_slice(&bot.u[src_off..src_off + cw]);
-                    v[r * 2 * cw..r * 2 * cw + cw]
-                        .copy_from_slice(&top.v[src_off..src_off + cw]);
+                    v[r * 2 * cw..r * 2 * cw + cw].copy_from_slice(&top.v[src_off..src_off + cw]);
                     v[(r * 2 + 1) * cw..(r * 2 + 1) * cw + cw]
                         .copy_from_slice(&bot.v[src_off..src_off + cw]);
                 }
@@ -499,17 +479,22 @@ impl Decoder {
     }
 
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
+        let mut peek = BitstreamReader::new(&nal.rbsp);
+        let _first_mb = peek.read_ue()?;
+        let _slice_type = peek.read_ue()?;
+        let pps_id = peek.read_ue()?;
         let pps = self
             .pps_table
-            .values()
-            .next()
-            .ok_or(DecodeError::InvalidSyntax("no PPS available"))?;
+            .get(&pps_id)
+            .ok_or(DecodeError::InvalidSyntax(
+                "slice references an unknown PPS",
+            ))?;
         let sps = self
             .sps_table
             .get(&pps.seq_parameter_set_id)
             .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
 
-        let (header, mut reader) =
+        let (header, reader) =
             parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
 
         if header.slice_type != SliceType::I
@@ -519,150 +504,13 @@ impl Decoder {
             return Err(DecodeError::from("unsupported slice type"));
         }
         let is_field_pic = header.field_pic_flag;
-        let is_p_slice = header.slice_type == SliceType::P;
-        let is_b_slice = header.slice_type == SliceType::B;
 
         // Compute POC for current picture (needed for B-slice ref list construction)
         let current_poc = self
             .dpb
             .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
 
-        // Build reference picture lists
-        // For field pictures: MaxPicNum = 2*MaxFrameNum, CurrPicNum = 2*frame_num+1
-        let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4).min(31);
-        let max_pic_num = if is_field_pic {
-            max_frame_num.saturating_mul(2)
-        } else {
-            max_frame_num
-        };
-        let curr_pic_num = if is_field_pic {
-            header.frame_num.saturating_mul(2).saturating_add(1)
-        } else {
-            header.frame_num
-        };
-        let mut ref_pic_list = if is_p_slice {
-            let mut refs = self
-                .dpb
-                .short_term_ref_list(is_field_pic, header.bottom_field_flag);
-            // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
-            // if the list is shorter, duplicate the last entry to fill)
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
-            }
-            refs
-        } else {
-            vec![]
-        };
-        let mut _ref_pic_list_l0 = if is_b_slice {
-            let mut refs = self
-                .dpb
-                .ref_list_l0_b(current_poc, is_field_pic, header.bottom_field_flag);
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l0_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
-            }
-            refs
-        } else {
-            vec![]
-        };
-        let mut _ref_pic_list_l1 = if is_b_slice {
-            let mut refs = self
-                .dpb
-                .ref_list_l1_b(current_poc, is_field_pic, header.bottom_field_flag);
-            if !refs.is_empty() {
-                while refs.len() < header.num_ref_idx_l1_active as usize {
-                    refs.push(refs.last().unwrap().clone());
-                }
-            }
-            refs
-        } else {
-            vec![]
-        };
-
-        // Apply ref_pic_list_modification (spec 8.2.4.3)
-        if is_p_slice && !header.ref_list_mod_l0.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut ref_pic_list,
-                &header.ref_list_mod_l0,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
-        if is_b_slice && !header.ref_list_mod_l0.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut _ref_pic_list_l0,
-                &header.ref_list_mod_l0,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
-        if is_b_slice && !header.ref_list_mod_l1.is_empty() {
-            Dpb::apply_ref_list_modification(
-                &mut _ref_pic_list_l1,
-                &header.ref_list_mod_l1,
-                curr_pic_num,
-                max_pic_num,
-                is_field_pic,
-                header.bottom_field_flag,
-            );
-        }
-
-        // Weighted prediction mode:
-        // 0 = no weighting (default)
-        // 1 = explicit weights (P-slice weighted_pred_flag=1, or B-slice weighted_bipred_idc=1)
-        // 2 = implicit weights (B-slice weighted_bipred_idc=2)
-        let use_weight = if (is_p_slice && pps.weighted_pred_flag)
-            || (is_b_slice && pps.weighted_bipred_idc == 1)
-        {
-            1
-        } else if is_b_slice && pps.weighted_bipred_idc == 2 {
-            2
-        } else {
-            0
-        };
-
-        // Implicit weighted prediction: compute L0 weight from POC distances.
-        // implicit_weights[l0_idx][l1_idx] = w0. L1 weight = 64 - w0. Fixed log2_denom=5.
-        let implicit_weights: Vec<Vec<i32>> = if use_weight == 2 {
-            _ref_pic_list_l0
-                .iter()
-                .map(|ref_l0| {
-                    _ref_pic_list_l1
-                        .iter()
-                        .map(|ref_l1| {
-                            let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
-                            if td == 0 {
-                                32
-                            } else {
-                                let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
-                                let tx = (16384 + (td.abs() / 2)) / td;
-                                let w1 = (tb * tx + 32) >> 8;
-                                if !(-64..=128).contains(&w1) {
-                                    32
-                                } else {
-                                    64 - w1
-                                }
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        let wctx = WeightContext {
-            use_weight,
-            wt: header.weight_table.as_ref(),
-            implicit_weights: &implicit_weights,
-        };
+        let lists = slice_setup::reference_lists(&self.dpb, sps, &header, current_poc)?;
 
         let width = sps.width();
         let frame_height = sps.height();
@@ -672,7 +520,11 @@ impl Decoder {
             return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
         }
         // For field pictures, each field has half the frame height
-        let height = if is_field_pic { frame_height / 2 } else { frame_height };
+        let height = if is_field_pic {
+            frame_height / 2
+        } else {
+            frame_height
+        };
         let mb_width = width.div_ceil(16);
         let mb_height = height.div_ceil(16);
         let coded_width = mb_width * 16;
@@ -685,11 +537,24 @@ impl Decoder {
         // For continuation slices (first_mb > 0), reuse the pending state
         // so per-MB data from earlier slices is visible for MV prediction,
         // CABAC neighbor contexts, and deblocking.
-        let is_continuation = header.first_mb_in_slice > 0
-            && self.pending.is_some()
-            && self.pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
+        let is_continuation = header.first_mb_in_slice > 0;
+        if is_continuation
+            && !self.pending.as_ref().is_some_and(|picture| {
+                picture.mb_slice_id.len() == total_mbs
+                    && picture.frame.width == width
+                    && picture.frame.height == height
+                    && picture.frame_num == header.frame_num
+                    && picture.poc == current_poc
+            })
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "inconsistent continuation slice",
+            ));
+        }
         let ps = if is_continuation {
-            self.pending.take().unwrap()
+            self.pending
+                .take()
+                .ok_or(DecodeError::InvalidSyntax("missing continuation picture"))?
         } else {
             PictureState {
                 frame: Frame {
@@ -744,7 +609,53 @@ impl Decoder {
             }
         };
 
-        // Destructure into local variables so existing code works unchanged
+        self.pending = Some(Self::decode_macroblocks(
+            nal,
+            sps,
+            pps,
+            &header,
+            reader,
+            ps,
+            lists,
+            current_poc,
+            is_continuation,
+        )?);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_macroblocks(
+        nal: &NalUnit,
+        sps: &Sps,
+        pps: &Pps,
+        header: &SliceHeader,
+        mut reader: BitstreamReader,
+        ps: PictureState,
+        lists: ReferenceLists,
+        current_poc: i32,
+        is_continuation: bool,
+    ) -> Result<PictureState, DecodeError> {
+        let is_field_pic = header.field_pic_flag;
+        let is_p_slice = header.slice_type == SliceType::P;
+        let is_b_slice = header.slice_type == SliceType::B;
+        let frame_height = sps.height();
+        let mb_width = ps.mb_width;
+        let mb_height = ps.mb_height;
+        let coded_width = mb_width * 16;
+        let coded_height = mb_height * 16;
+        let total_mbs = (mb_width * mb_height) as usize;
+        let slice_qp = header.qp_y(pps);
+        let (use_weight, implicit_weights) =
+            slice_setup::weights(pps, header, current_poc, &lists)?;
+        let ref_pic_list = lists.p.as_slice();
+        let _ref_pic_list_l0 = lists.l0.as_slice();
+        let _ref_pic_list_l1 = lists.l1.as_slice();
+        let wctx = WeightContext {
+            use_weight,
+            wt: header.weight_table.as_ref(),
+            implicit_weights: &implicit_weights,
+        };
+
         let PictureState {
             mut frame,
             frame_num: _ps_frame_num,
@@ -792,7 +703,9 @@ impl Decoder {
 
         // Increment slice ID for continuation slices so boundary checks work
         if is_continuation {
-            current_slice_id += 1;
+            current_slice_id = current_slice_id
+                .checked_add(1)
+                .ok_or(DecodeError::InvalidSyntax("too many slices in a picture"))?;
         }
         let this_slice_id = current_slice_id;
 
@@ -936,7 +849,9 @@ impl Decoder {
 
             // CABAC decode path
             if use_cabac {
-                let cr = cabac_reader.as_mut().unwrap();
+                let cr = cabac_reader
+                    .as_mut()
+                    .ok_or(DecodeError::InvalidSyntax("missing CABAC reader"))?;
                 let st = &mut cabac_state;
 
                 // MBAFF: end_of_slice_flag and mb_field_decoding_flag are both
@@ -985,7 +900,7 @@ impl Decoder {
                         make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
                     } else {
                         // B_Skip: spatial/temporal direct MV + MC, no residual
-                        make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
+                        make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params)?;
                     }
                     mb_info[mb_idx] = MbInfo {
                         mb_type: MbType::Inter,
@@ -1042,9 +957,9 @@ impl Decoder {
         };
         make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
 
-        // Store state back into pending PictureState.
+        // The caller commits a picture only after the complete slice succeeds.
         // Deblocking and DPB insertion happen in finalize_pending().
-        self.pending = Some(PictureState {
+        Ok(PictureState {
             frame,
             frame_num: header.frame_num,
             poc: current_poc,
@@ -1084,12 +999,10 @@ impl Decoder {
             mb_height,
             mb_field_decoding: _mb_field_decoding,
             mbaff_frame_flag: header.mbaff_frame_flag,
-                field_pic_flag: header.field_pic_flag,
-                bottom_field_flag: header.bottom_field_flag,
-                frame_height,
-        });
-
-        Ok(())
+            field_pic_flag: header.field_pic_flag,
+            bottom_field_flag: header.bottom_field_flag,
+            frame_height,
+        })
     }
 }
 
@@ -1185,7 +1098,11 @@ impl OrderedDecoder {
     /// are released.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Vec<Frame>, DecodeError> {
         let mut output = Vec::new();
-        let is_idr = nal.nal_unit_type == NalUnitType::SliceIdr;
+        let is_idr = if nal.nal_unit_type == NalUnitType::SliceIdr {
+            BitstreamReader::new(&nal.rbsp).read_ue()? == 0
+        } else {
+            false
+        };
 
         // Decode the NAL. Note that decode_nal returns the PREVIOUS frame
         // (the picture that just got finalized when this NAL started a new
@@ -1198,7 +1115,10 @@ impl OrderedDecoder {
         // This must happen AFTER the push so the previous GOP's last frame
         // gets the correct (old) gop_id.
         if is_idr {
-            self.gop_id += 1;
+            self.gop_id = self
+                .gop_id
+                .checked_add(1)
+                .ok_or(DecodeError::InvalidSyntax("GOP counter overflow"))?;
             // The previous GOP is now complete — drain everything from it
             // in display order.
             self.drain_completed_gops(&mut output);
@@ -1206,7 +1126,7 @@ impl OrderedDecoder {
 
         // Bound buffer depth to limit reorder latency.
         while self.buffer.len() > self.max_depth {
-            output.push(self.pop_lowest());
+            output.push(self.pop_lowest()?);
         }
 
         Ok(output)
@@ -1256,15 +1176,15 @@ impl OrderedDecoder {
     }
 
     /// Remove and return the buffered frame with the lowest `(gop, poc)`.
-    fn pop_lowest(&mut self) -> Frame {
+    fn pop_lowest(&mut self) -> Result<Frame, DecodeError> {
         let idx = self
             .buffer
             .iter()
             .enumerate()
             .min_by_key(|(_, (g, f))| (*g, f.pic_order_cnt))
             .map(|(i, _)| i)
-            .unwrap();
-        self.buffer.remove(idx).1
+            .ok_or(DecodeError::InvalidSyntax("empty picture reorder buffer"))?;
+        Ok(self.buffer.remove(idx).1)
     }
 }
 

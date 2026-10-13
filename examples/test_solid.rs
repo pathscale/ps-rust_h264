@@ -1,5 +1,5 @@
-use rust_h264::decoder::Decoder;
-use rust_h264::nal::parse_annex_b;
+use ps_rust_h264::decoder::Decoder;
+use ps_rust_h264::nal::parse_annex_b;
 
 fn main() {
     let data = std::fs::read("/tmp/solid_gray.h264").unwrap();

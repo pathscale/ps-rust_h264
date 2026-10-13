@@ -1,4 +1,4 @@
-# rust_h264
+# ps-rust_h264
 
 While working on rust_media, it was found that there isn't any sufficiently good open source h264 decoder. There is openH264, but it is limited to baseline h264. ffmpeg has its own h264 decoder but it isn't split out as a library.
 
@@ -19,8 +19,8 @@ The recommended entry point is `OrderedDecoder`, which buffers and emits
 frames in **display order** automatically — no manual sorting or GOP tracking.
 
 ```rust
-use rust_h264::decoder::OrderedDecoder;
-use rust_h264::nal::parse_annex_b;
+use ps_rust_h264::decoder::OrderedDecoder;
+use ps_rust_h264::nal::parse_annex_b;
 
 let h264_data = std::fs::read("input.h264").unwrap();
 let nals = parse_annex_b(&h264_data);
@@ -48,8 +48,8 @@ or feed frames directly to an encoder that doesn't care about display order
 — use `Decoder` instead. It returns one frame at a time in **decode order**.
 
 ```rust
-use rust_h264::decoder::Decoder;
-use rust_h264::nal::parse_annex_b;
+use ps_rust_h264::decoder::Decoder;
+use ps_rust_h264::nal::parse_annex_b;
 
 let nals = parse_annex_b(&std::fs::read("input.h264").unwrap());
 let mut decoder = Decoder::new();
@@ -73,7 +73,7 @@ the start of a new picture, so increment your GOP counter **after** the
 call, not before:
 
 ```rust
-use rust_h264::nal::NalUnitType;
+use ps_rust_h264::nal::NalUnitType;
 
 let mut idr_count: u32 = 0;
 let mut frames = Vec::new();
@@ -105,8 +105,8 @@ for the `avcC` configuration box and `parse_avcc` for each sample. The decoder
 itself is unchanged — only the framing parser differs.
 
 ```rust
-use rust_h264::decoder::OrderedDecoder;
-use rust_h264::nal::{parse_avcc, parse_avcc_config};
+use ps_rust_h264::decoder::OrderedDecoder;
+use ps_rust_h264::nal::{parse_avcc, parse_avcc_config};
 
 // Get the avcC box payload from your MP4 demuxer
 let config = parse_avcc_config(&avcc_box_payload).unwrap();

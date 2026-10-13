@@ -4,8 +4,8 @@
 ///
 /// If no output path is given, replaces the .h264 extension with .yuv.
 /// Frames are sorted by POC (display order) within each IDR period.
-use rust_h264::decoder::Decoder;
-use rust_h264::nal::{parse_annex_b, NalUnitType};
+use ps_rust_h264::decoder::Decoder;
+use ps_rust_h264::nal::{parse_annex_b, NalUnitType};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -28,7 +28,7 @@ fn main() {
     // Track IDR boundaries so we can sort within each period.
     // Each frame gets (idr_index, poc, decode_order) for sorting.
     let mut idr_count: u32 = 0;
-    let mut frames: Vec<(u32, i32, usize, rust_h264::decoder::Frame)> = Vec::new();
+    let mut frames: Vec<(u32, i32, usize, ps_rust_h264::decoder::Frame)> = Vec::new();
     let mut decode_order: usize = 0;
 
     for nal in &nals {

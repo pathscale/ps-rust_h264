@@ -440,6 +440,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps-rust_h264"
+version = "0.4.0"
+dependencies = [
+ "minifb",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -467,13 +474,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce70a74e890531977d37e532c34d45e9055d2409ed08ddba14529471ed0be16"
 dependencies = [
  "bitflags 2.11.0",
-]
-
-[[package]]
-name = "rust_h264"
-version = "0.4.0"
-dependencies = [
- "minifb",
 ]
 
 [[package]]

@@ -6,8 +6,8 @@
 /// display order, then displays each frame at the specified rate.
 /// Press Escape to quit. With --loop, playback repeats from the beginning.
 use minifb::{Key, Window, WindowOptions};
-use rust_h264::decoder::{Decoder, Frame};
-use rust_h264::nal::{parse_annex_b, NalUnitType};
+use ps_rust_h264::decoder::{Decoder, Frame};
+use ps_rust_h264::nal::{parse_annex_b, NalUnitType};
 use std::time::{Duration, Instant};
 
 /// Convert YUV420 frame to ARGB pixel buffer for display.

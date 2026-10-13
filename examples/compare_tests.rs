@@ -1,7 +1,7 @@
-use rust_h264::nal::{parse_annex_b, NalUnitType};
-use rust_h264::pps::parse_pps;
-use rust_h264::slice::parse_slice_header;
-use rust_h264::sps::parse_sps;
+use ps_rust_h264::nal::{parse_annex_b, NalUnitType};
+use ps_rust_h264::pps::parse_pps;
+use ps_rust_h264::slice::parse_slice_header;
+use ps_rust_h264::sps::parse_sps;
 
 fn analyze_file(name: &str) {
     println!("=== {} ===", name);

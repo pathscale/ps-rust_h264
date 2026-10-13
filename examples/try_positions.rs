@@ -1,4 +1,4 @@
-use rust_h264::nal::{parse_annex_b, NalUnitType};
+use ps_rust_h264::nal::{parse_annex_b, NalUnitType};
 
 // Table 9-5(a): 0 <= nC < 2
 #[rustfmt::skip]

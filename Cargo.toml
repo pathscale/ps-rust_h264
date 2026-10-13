@@ -1,10 +1,10 @@
 [package]
-name = "rust_h264"
+name = "ps-rust_h264"
 version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Pure Rust H.264/AVC video decoder"
-repository = "https://github.com/roticv/rust_h264"
+description = "Pure Rust H.264/AVC video decoder (pathscale fork of rust_h264: Arc pictures, no panics on bad input, stream reorder depth)"
+repository = "https://github.com/pathscale/ps-rust_h264"
 keywords = ["h264", "avc", "video", "decoder", "codec"]
 categories = ["multimedia::video"]
 exclude = ["testdata/", "examples/", "fuzz/", "BENCHMARK.md"]

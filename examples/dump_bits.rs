@@ -1,4 +1,4 @@
-use rust_h264::nal::{parse_annex_b, NalUnitType};
+use ps_rust_h264::nal::{parse_annex_b, NalUnitType};
 
 fn main() {
     let data = std::fs::read("/tmp/bars.h264").unwrap();

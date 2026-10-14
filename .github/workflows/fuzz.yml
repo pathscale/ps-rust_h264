@@ -29,6 +29,8 @@ jobs:
           - decode_avcc
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly

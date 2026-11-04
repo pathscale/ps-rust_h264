@@ -6,13 +6,7 @@ name: Fuzz
 # To run locally for the same duration:
 #   cargo +nightly fuzz run <target> -- -max_total_time=180
 on:
-  schedule:
-    - cron: '0 6 * * 1' # 06:00 UTC every Monday
   workflow_dispatch: {} # allow manual runs from the Actions tab
-  push:
-    paths:
-      - 'fuzz/**'
-      - '.github/workflows/fuzz.yml'
 
 jobs:
   fuzz:

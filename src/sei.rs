@@ -25,29 +25,38 @@ pub fn parse_sei(rbsp: &[u8]) -> Result<Vec<SeiMessage>, &'static str> {
         // Read payloadType: sum of 0xFF bytes, plus final byte < 0xFF
         let mut payload_type: u32 = 0;
         while offset < rbsp.len() && rbsp[offset] == 0xFF {
-            payload_type += 255;
+            payload_type = payload_type
+                .checked_add(255)
+                .ok_or("SEI accumulator overflow")?;
             offset += 1;
         }
         if offset >= rbsp.len() {
             return Err("unexpected end of SEI payload type");
         }
-        payload_type += rbsp[offset] as u32;
+        payload_type = payload_type
+            .checked_add(rbsp[offset] as u32)
+            .ok_or("SEI accumulator overflow")?;
         offset += 1;
 
         // Read payloadSize: same encoding
         let mut payload_size: u32 = 0;
         while offset < rbsp.len() && rbsp[offset] == 0xFF {
-            payload_size += 255;
+            payload_size = payload_size
+                .checked_add(255)
+                .ok_or("SEI accumulator overflow")?;
             offset += 1;
         }
         if offset >= rbsp.len() {
             return Err("unexpected end of SEI payload size");
         }
-        payload_size += rbsp[offset] as u32;
+        payload_size = payload_size
+            .checked_add(rbsp[offset] as u32)
+            .ok_or("SEI accumulator overflow")?;
         offset += 1;
 
-        let size = payload_size as usize;
-        if offset + size > rbsp.len() {
+        let size = usize::try_from(payload_size)
+            .map_err(|_| "SEI payload size does not fit usize")?;
+        if size > rbsp.len().saturating_sub(offset) {
             return Err("SEI payload size exceeds RBSP length");
         }
 

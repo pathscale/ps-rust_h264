@@ -46,6 +46,7 @@ pub struct Frame {
 #[derive(Clone)]
 struct PictureState {
     frame: Frame,
+    pps_id: u32,
     frame_num: u32,
     poc: i32,
     nal_unit_type: NalUnitType,
@@ -554,6 +555,12 @@ impl Decoder {
                     && picture.frame.height == height
                     && picture.frame_num == header.frame_num
                     && picture.poc == current_poc
+                    && picture.pps_id == pps_id
+                    && picture.mbaff_frame_flag == header.mbaff_frame_flag
+                    && picture.field_pic_flag == header.field_pic_flag
+                    && picture.bottom_field_flag == header.bottom_field_flag
+                    && picture.nal_unit_type == nal.nal_unit_type
+                    && picture.nal_ref_idc == nal.nal_ref_idc
             })
         {
             return Err(DecodeError::InvalidSyntax(
@@ -574,6 +581,7 @@ impl Decoder {
                     v: vec![0u8; (coded_width * coded_height / 4) as usize],
                     pic_order_cnt: current_poc,
                 },
+                pps_id,
                 frame_num: header.frame_num,
                 poc: current_poc,
                 nal_unit_type: nal.nal_unit_type,

@@ -193,6 +193,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
     let _reserved_zero_2bits = r.read_bits(2)?;
     let level_idc = r.read_bits(8)? as u8;
     let seq_parameter_set_id = r.read_ue()?;
+    if seq_parameter_set_id > 31 {
+        return Err("SPS id out of range");
+    }
 
     let mut chroma_format_idc = 1; // default
     let mut separate_colour_plane_flag = false;

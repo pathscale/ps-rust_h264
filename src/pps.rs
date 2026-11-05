@@ -37,6 +37,9 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
 
     let pic_parameter_set_id = r.read_ue()?;
     let seq_parameter_set_id = r.read_ue()?;
+    if pic_parameter_set_id > 255 || seq_parameter_set_id > 31 {
+        return Err("PPS or referenced SPS id out of range");
+    }
     let entropy_coding_mode_flag = r.read_bit()? != 0;
     let bottom_field_pic_order_in_frame_present_flag = r.read_bit()? != 0;
     let num_slice_groups_minus1 = r.read_ue()?;

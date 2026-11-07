@@ -9,7 +9,7 @@ use crate::dpb::{DecodedPicture, Dpb, ReferenceStatus};
 use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
-use crate::pps::{parse_pps, Pps};
+use crate::pps::{parse_pps, parse_pps_with_len, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::slice_setup::{self, ReferenceLists};
@@ -42,11 +42,28 @@ pub struct Frame {
     pub pic_order_cnt: i32,
 }
 
+// A slice ID distinct from every successfully decoded macroblock.
+const UNDECODED_MB: u16 = u16::MAX;
+
+struct StoredPps {
+    parsed: Arc<Pps>,
+    sps_revision: Arc<Sps>,
+    rbsp: Box<[u8]>,
+}
+
+struct DecodedOutput {
+    frame: Frame,
+    reorder_depth: Option<usize>,
+}
+
 /// In-progress picture state shared across slices within the same frame.
 #[derive(Clone)]
 struct PictureState {
     frame: Frame,
     pps_id: u32,
+    sps_revision: Arc<Sps>,
+    pps_revision: Arc<Pps>,
+    previous_poc_state: (i32, u32),
     frame_num: u32,
     poc: i32,
     nal_unit_type: NalUnitType,
@@ -135,16 +152,13 @@ struct PictureState {
 /// }
 /// ```
 pub struct Decoder {
-    sps_table: HashMap<u32, Sps>,
-    pps_table: HashMap<u32, Pps>,
+    sps_table: HashMap<u32, Arc<Sps>>,
+    pps_table: HashMap<u32, StoredPps>,
     dpb: Dpb,
     /// In-progress picture being assembled from one or more slices.
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
-    pending_field: Option<Frame>,
-    /// Display reorder depth the latest SPS promises: 0 for POC type 2 (output order is decode order), else
-    /// its VUI max_num_reorder_frames. `None` when the stream does not say.
-    reorder_depth: Option<usize>,
+    pending_field: Option<DecodedOutput>,
 }
 
 impl Default for Decoder {
@@ -162,7 +176,6 @@ impl Decoder {
             dpb: Dpb::new(0),
             pending: None,
             pending_field: None,
-            reorder_depth: None,
         }
     }
 
@@ -180,16 +193,23 @@ impl Decoder {
     /// Call [`flush`](Self::flush) after the last NAL to retrieve any
     /// remaining buffered frame.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Option<Frame>, DecodeError> {
+        Ok(self.decode_nal_with_depth(nal)?.map(|output| output.frame))
+    }
+
+    fn decode_nal_with_depth(
+        &mut self,
+        nal: &NalUnit,
+    ) -> Result<Option<DecodedOutput>, DecodeError> {
         match nal.nal_unit_type {
             NalUnitType::Sps => {
                 let sps = parse_sps(&nal.rbsp)?;
-                self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
-                self.reorder_depth = if sps.pic_order_cnt_type == 2 {
-                    Some(0)
-                } else {
-                    sps.max_num_reorder_frames.map(|frames| frames as usize)
-                };
-                self.sps_table.insert(sps.seq_parameter_set_id, sps);
+                if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+                    return Err(DecodeError::Unsupported("only 8-bit H.264 is supported"));
+                }
+                let id = sps.seq_parameter_set_id;
+                if self.sps_table.get(&id).map(Arc::as_ref) != Some(&sps) {
+                    self.sps_table.insert(id, Arc::new(sps));
+                }
                 Ok(None)
             }
             NalUnitType::Pps => {
@@ -200,8 +220,21 @@ impl Decoder {
                     .sps_table
                     .get(&sps_id)
                     .ok_or(DecodeError::InvalidSyntax("PPS references an unknown SPS"))?;
-                let pps = parse_pps(&nal.rbsp, Some(sps))?;
-                self.pps_table.insert(pps.pic_parameter_set_id, pps);
+                let (pps, len) = parse_pps_with_len(&nal.rbsp, Some(sps))?;
+                let id = pps.pic_parameter_set_id;
+                let rbsp = &nal.rbsp[..len];
+                if !self.pps_table.get(&id).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.sps_revision, sps) && entry.rbsp.as_ref() == rbsp
+                }) {
+                    self.pps_table.insert(
+                        id,
+                        StoredPps {
+                            parsed: Arc::new(pps),
+                            sps_revision: Arc::clone(sps),
+                            rbsp: rbsp.into(),
+                        },
+                    );
+                }
                 Ok(None)
             }
             NalUnitType::Sei => Ok(None),
@@ -217,7 +250,7 @@ impl Decoder {
 
                 // Finalize pending frame if a new picture starts
                 let prev_frame = if is_new_picture {
-                    self.finalize_pending()
+                    self.finalize_pending(false)
                 } else {
                     None
                 };
@@ -242,7 +275,11 @@ impl Decoder {
     /// final frame, which is otherwise held internally awaiting a new picture
     /// to trigger its release.
     pub fn flush(&mut self) -> Option<Frame> {
-        let frame = self.finalize_pending();
+        self.flush_with_depth().map(|output| output.frame)
+    }
+
+    fn flush_with_depth(&mut self) -> Option<DecodedOutput> {
+        let frame = self.finalize_pending(true);
         if frame.is_some() {
             return frame;
         }
@@ -273,9 +310,27 @@ impl Decoder {
     }
 
     /// Finalize the pending picture: apply deblocking, insert into DPB, return frame.
-    fn finalize_pending(&mut self) -> Option<Frame> {
+    fn finalize_pending(&mut self, keep_unpaired_field: bool) -> Option<DecodedOutput> {
         let mut ps = self.pending.take()?;
+        if ps.mb_slice_id.contains(&UNDECODED_MB) {
+            // A slice can end successfully while the picture still has holes.
+            self.dpb.restore_poc_state(ps.previous_poc_state);
+            if !keep_unpaired_field {
+                self.pending_field = None;
+            }
+            return None;
+        }
 
+        let sps = &ps.sps_revision;
+        self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
+        let reorder_depth = if sps.pic_order_cnt_type == 2 {
+            Some(0)
+        } else {
+            sps.max_num_reorder_frames.map(|frames| frames as usize)
+        };
+
+        // Filtering addresses the coded raster, including cropped columns.
+        let display_width = std::mem::replace(&mut ps.frame.width, ps.mb_width * 16);
         // Apply deblocking filter
         deblock::filter_frame_mbaff(
             &mut ps.frame,
@@ -287,6 +342,7 @@ impl Decoder {
             ps.chroma_qp_index_offset,
             ps.mbaff_frame_flag,
         );
+        ps.frame.width = display_width;
 
         if ps.nal_unit_type == NalUnitType::SliceIdr {
             self.dpb.clear();
@@ -344,7 +400,7 @@ impl Decoder {
             u: ps.frame.u.clone(),
             v: ps.frame.v.clone(),
             width: ps.mb_width * 16,
-            height: (ps.frame.height.div_ceil(16)) * 16,
+            height: ps.mb_height * 16,
             frame_num: ps.frame_num,
             pic_order_cnt: ps.poc,
             mv_l0: ps.mv_store_l0,
@@ -418,9 +474,14 @@ impl Decoder {
         }
 
         // For field pictures, combine two fields into one frame for output
+        let output = DecodedOutput {
+            frame: ps.frame,
+            reorder_depth,
+        };
         if ps.field_pic_flag {
-            let field_frame = ps.frame;
-            if let Some(first_field) = self.pending_field.take() {
+            let field_frame = &output.frame;
+            if let Some(first) = self.pending_field.take() {
+                let first_field = &first.frame;
                 // Second field arrived — combine into a full frame
                 let w = field_frame.width as usize;
                 let full_h = ps.frame_height as usize;
@@ -439,17 +500,17 @@ impl Decoder {
                         && f.u.len() >= ch * cw
                         && f.v.len() >= ch * cw
                 };
-                if w == 0 || full_h < 2 || !field_ok(&first_field) || !field_ok(&field_frame) {
+                if w == 0 || full_h < 2 || !field_ok(first_field) || !field_ok(field_frame) {
                     // Drop the stale field and hold the current one instead.
-                    self.pending_field = Some(field_frame);
+                    self.pending_field = Some(output);
                     return None;
                 }
 
                 // Determine which is top and which is bottom
                 let (top, bot) = if ps.bottom_field_flag {
-                    (&first_field, &field_frame)
+                    (first_field, field_frame)
                 } else {
-                    (&field_frame, &first_field)
+                    (field_frame, first_field)
                 };
 
                 // Interleave luma lines: top→even, bottom→odd
@@ -470,39 +531,64 @@ impl Decoder {
                         .copy_from_slice(&bot.v[src_off..src_off + cw]);
                 }
 
-                return Some(Frame {
-                    y,
-                    u,
-                    v,
-                    width: w as u32,
-                    height: full_h as u32,
-                    pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+                return Some(DecodedOutput {
+                    frame: Frame {
+                        y,
+                        u,
+                        v,
+                        width: w as u32,
+                        height: full_h as u32,
+                        pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+                    },
+                    reorder_depth: first
+                        .reorder_depth
+                        .zip(reorder_depth)
+                        .map(|(a, b)| a.max(b)),
                 });
             } else {
                 // First field — hold it, return None
-                self.pending_field = Some(field_frame);
+                self.pending_field = Some(output);
                 return None;
             }
         }
 
-        Some(ps.frame)
+        Some(output)
     }
 
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
         let mut peek = BitstreamReader::new(&nal.rbsp);
-        let _first_mb = peek.read_ue()?;
+        let is_continuation = peek.read_ue()? > 0;
         let _slice_type = peek.read_ue()?;
         let pps_id = peek.read_ue()?;
-        let pps = self
+        let entry = self
             .pps_table
-            .get(&pps_id)
+            .get_mut(&pps_id)
             .ok_or(DecodeError::InvalidSyntax(
                 "slice references an unknown PPS",
             ))?;
         let sps = self
             .sps_table
-            .get(&pps.seq_parameter_set_id)
+            .get(&entry.parsed.seq_parameter_set_id)
             .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
+
+        // Reject a changed parameter set before it can affect the slice header or POC.
+        if is_continuation
+            && !self.pending.as_ref().is_some_and(|picture| {
+                picture.pps_id == pps_id
+                    && Arc::ptr_eq(&picture.sps_revision, sps)
+                    && Arc::ptr_eq(&picture.pps_revision, &entry.parsed)
+            })
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "inconsistent continuation parameter sets",
+            ));
+        }
+        if !Arc::ptr_eq(&entry.sps_revision, sps) {
+            // Effective scaling lists include defaults inherited from the active SPS.
+            entry.parsed = Arc::new(parse_pps(&entry.rbsp, Some(sps))?);
+            entry.sps_revision = Arc::clone(sps);
+        }
+        let pps = &entry.parsed;
 
         let (header, reader) =
             parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
@@ -516,6 +602,11 @@ impl Decoder {
         let is_field_pic = header.field_pic_flag;
 
         // Compute POC for current picture (needed for B-slice ref list construction)
+        let previous_poc_state = self.dpb.poc_state();
+        if let Some(picture) = self.pending.as_ref().filter(|_| is_continuation) {
+            // Every slice derives this picture's POC from the same prior picture.
+            self.dpb.restore_poc_state(picture.previous_poc_state);
+        }
         let current_poc = self
             .dpb
             .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
@@ -535,10 +626,15 @@ impl Decoder {
         } else {
             frame_height
         };
-        let mb_width = width.div_ceil(16);
-        let mb_height = height.div_ceil(16);
-        let coded_width = mb_width * 16;
-        let coded_height = mb_height * 16;
+        let coded_width = sps.coded_width();
+        let coded_height = sps.coded_height() / if is_field_pic { 2 } else { 1 };
+        if height == 0 || coded_width > 16384 || coded_height > 16384 {
+            return Err(DecodeError::InvalidSyntax(
+                "SPS coded dimensions out of range",
+            ));
+        }
+        let mb_width = coded_width / 16;
+        let mb_height = coded_height / 16;
         let total_mbs = (mb_width * mb_height) as usize;
 
         let slice_qp = header.qp_y(pps);
@@ -547,7 +643,6 @@ impl Decoder {
         // For continuation slices (first_mb > 0), reuse the pending state
         // so per-MB data from earlier slices is visible for MV prediction,
         // CABAC neighbor contexts, and deblocking.
-        let is_continuation = header.first_mb_in_slice > 0;
         if is_continuation
             && !self.pending.as_ref().is_some_and(|picture| {
                 picture.mb_slice_id.len() == total_mbs
@@ -555,7 +650,6 @@ impl Decoder {
                     && picture.frame.height == height
                     && picture.frame_num == header.frame_num
                     && picture.poc == current_poc
-                    && picture.pps_id == pps_id
                     && picture.mbaff_frame_flag == header.mbaff_frame_flag
                     && picture.field_pic_flag == header.field_pic_flag
                     && picture.bottom_field_flag == header.bottom_field_flag
@@ -582,6 +676,9 @@ impl Decoder {
                     pic_order_cnt: current_poc,
                 },
                 pps_id,
+                sps_revision: Arc::clone(sps),
+                pps_revision: Arc::clone(pps),
+                previous_poc_state,
                 frame_num: header.frame_num,
                 poc: current_poc,
                 nal_unit_type: nal.nal_unit_type,
@@ -605,7 +702,7 @@ impl Decoder {
                 mb_is_direct: vec![false; total_mbs],
                 blk_is_direct: vec![false; total_mbs * 16],
                 is_i16x16: vec![false; total_mbs],
-                mb_slice_id: vec![0u16; total_mbs],
+                mb_slice_id: vec![UNDECODED_MB; total_mbs],
                 current_slice_id: 0,
                 prev_mb_qp: slice_qp,
                 last_qp_delta_nonzero: false,
@@ -675,6 +772,10 @@ impl Decoder {
 
         let PictureState {
             mut frame,
+            pps_id,
+            sps_revision,
+            pps_revision,
+            previous_poc_state,
             frame_num: _ps_frame_num,
             poc: _ps_poc,
             nal_unit_type: _ps_nal_type,
@@ -722,6 +823,7 @@ impl Decoder {
         if is_continuation {
             current_slice_id = current_slice_id
                 .checked_add(1)
+                .filter(|id| *id != UNDECODED_MB)
                 .ok_or(DecodeError::InvalidSyntax("too many slices in a picture"))?;
         }
         let this_slice_id = current_slice_id;
@@ -832,14 +934,13 @@ impl Decoder {
         };
 
         // In MBAFF, first_mb_in_slice is a pair address
-        let mut mb_idx = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
-        if mb_idx >= total_mbs {
+        let addr_scale = if mbaff { 2 } else { 1 };
+        let first_mb_addr = header.first_mb_in_slice as usize;
+        if first_mb_addr >= total_mbs / addr_scale {
             return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
         }
+        let first_mb = first_mb_addr * addr_scale;
+        let mut mb_idx = first_mb;
         while mb_idx < total_mbs {
             // CAVLC end-of-slice: check before reading any new syntax elements.
             // Skip this check when counting down a skip run (no reads needed).
@@ -848,7 +949,7 @@ impl Decoder {
             }
 
             // Stamp this MB with the current slice ID for boundary detection
-            mb_slice_id[mb_idx] = this_slice_id;
+            let previous_slice_id = std::mem::replace(&mut mb_slice_id[mb_idx], this_slice_id);
             // Compute pixel position
             let (mb_x, mb_y) = if mbaff {
                 let pair_addr = mb_idx / 2;
@@ -877,7 +978,10 @@ impl Decoder {
                 {
                     let mut ctx = make_ctx!();
                     match ctx.decode_cabac_mb(cr, st, &nal.rbsp, mb_idx, mb_x, mb_y, &params)? {
-                        CabacMbResult::EndOfSlice => break,
+                        CabacMbResult::EndOfSlice => {
+                            ctx.mb_slice_id[mb_idx] = previous_slice_id;
+                            break;
+                        }
                         CabacMbResult::Decoded => {}
                     }
                     prev_mb_qp = ctx.prev_mb_qp;
@@ -898,7 +1002,11 @@ impl Decoder {
             // P/B-slice skip run handling
             if is_p_slice || is_b_slice {
                 if mb_skip_run < 0 {
-                    mb_skip_run = reader.read_ue()? as i32;
+                    let run = reader.read_ue()? as usize;
+                    if run > total_mbs - mb_idx {
+                        return Err(DecodeError::InvalidSyntax("mb_skip_run out of range"));
+                    }
+                    mb_skip_run = run as i32;
                 }
                 if mb_skip_run > 0 {
                     mb_skip_run -= 1;
@@ -967,17 +1075,16 @@ impl Decoder {
         }
 
         // Post-loop: fill deblock info and ref POC table
-        let first_mb = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
         make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
 
         // The caller commits a picture only after the complete slice succeeds.
         // Deblocking and DPB insertion happen in finalize_pending().
         Ok(PictureState {
             frame,
+            pps_id,
+            sps_revision,
+            pps_revision,
+            previous_poc_state,
             frame_num: header.frame_num,
             poc: current_poc,
             nal_unit_type: nal.nal_unit_type,
@@ -1124,9 +1231,13 @@ impl OrderedDecoder {
         // Decode the NAL. Note that decode_nal returns the PREVIOUS frame
         // (the picture that just got finalized when this NAL started a new
         // one), so the returned frame still belongs to the current gop_id.
-        if let Some(frame) = self.inner.decode_nal(nal)? {
-            self.buffer.push((self.gop_id, frame));
-        }
+        let depth = self.inner.decode_nal_with_depth(nal)?.map(|decoded| {
+            self.buffer.push((self.gop_id, decoded.frame));
+            decoded
+                .reorder_depth
+                .unwrap_or(self.max_depth)
+                .min(self.max_depth)
+        });
 
         // After pushing, advance the GOP if this NAL was an IDR start.
         // This must happen AFTER the push so the previous GOP's last frame
@@ -1141,13 +1252,12 @@ impl OrderedDecoder {
             self.drain_completed_gops(&mut output);
         }
 
-        // Bound buffer depth to limit reorder latency; a stream that declares its reorder depth needs no more.
-        let depth = self
-            .inner
-            .reorder_depth
-            .map_or(self.max_depth, |depth| depth.min(self.max_depth));
-        while self.buffer.len() > depth {
-            output.push(self.pop_lowest()?);
+        // The bound comes from the picture returned above, not the slice that
+        // triggered its finalization. Parameter-set NALs do not release frames.
+        if let Some(depth) = depth {
+            while self.buffer.len() > depth {
+                output.push(self.pop_lowest()?);
+            }
         }
 
         Ok(output)
@@ -1157,8 +1267,8 @@ impl OrderedDecoder {
     /// Call this once after the last `decode_nal`.
     pub fn flush(&mut self) -> Vec<Frame> {
         // First, get any final pending frame from the inner decoder.
-        if let Some(frame) = self.inner.flush() {
-            self.buffer.push((self.gop_id, frame));
+        if let Some(decoded) = self.inner.flush_with_depth() {
+            self.buffer.push((self.gop_id, decoded.frame));
         }
         // Drain everything in (gop, poc) order.
         self.buffer.sort_by_key(|(g, f)| (*g, f.pic_order_cnt));
@@ -1836,6 +1946,295 @@ mod tests {
         // Tests multi-slice P-frame decode with cross-slice intra prediction
         // and nC boundary handling across both I and P slices.
         decode_multiframe_and_compare("ms_cavlc_p_test", 5, 64, 64);
+    }
+
+    #[test]
+    fn test_multislice_parameter_set_revision() {
+        let stream = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/ms_cavlc_p_test.h264"
+        ))
+        .unwrap();
+        let expected = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/ms_cavlc_p_test.yuv"
+        ))
+        .unwrap();
+        let nals = parse_annex_b(&stream);
+        let sps = nals
+            .iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .unwrap();
+        let pps = nals
+            .iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Pps)
+            .unwrap();
+        let slices: Vec<_> = nals
+            .iter()
+            .filter(|nal| {
+                matches!(
+                    nal.nal_unit_type,
+                    NalUnitType::SliceIdr | NalUnitType::Slice
+                )
+            })
+            .collect();
+        let idr = &slices[..4];
+
+        // The fixture uses SPS 0 with POC type 2 and one reference frame.
+        // Replace it with a slice-compatible SPS 0 that permits two references.
+        let replacement_sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x0a, 0xdb, 0x10, 0x99]),
+        };
+        // PPS 0 with constrained intra prediction enabled. The IDR is all intra.
+        let replacement_pps = NalUnit {
+            nal_unit_type: NalUnitType::Pps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0xcf, 0x32, 0xe8]),
+        };
+        // SPS 1 also permits two references, but uses POC type 0 with no VUI.
+        let unrelated_sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x0a, 0x5d, 0x88, 0x4c, 0x80]),
+        };
+        // PPS 1 references SPS 1.
+        let unrelated_pps = NalUnit {
+            nal_unit_type: NalUnitType::Pps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x48, 0xf3, 0x2c, 0x80]),
+        };
+
+        let setup = || {
+            let mut decoder = Decoder::new();
+            for nal in [sps, pps] {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            decoder
+        };
+        let assert_frame = |frame: Frame, index: usize| {
+            let size = 64 * 64 * 3 / 2;
+            let yuv = [frame.y, frame.u, frame.v].concat();
+            assert_eq!(yuv.as_slice(), &expected[index * size..(index + 1) * size]);
+        };
+
+        for replacement in [&replacement_sps, &replacement_pps] {
+            let mut decoder = setup();
+            assert!(decoder.decode_nal(idr[0]).unwrap().is_none());
+            assert!(decoder.decode_nal(replacement).unwrap().is_none());
+            assert!(matches!(
+                decoder.decode_nal(idr[1]),
+                Err(DecodeError::InvalidSyntax(
+                    "inconsistent continuation parameter sets"
+                ))
+            ));
+            assert!(decoder.flush().is_none());
+
+            for nal in idr {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            assert_frame(decoder.flush().unwrap(), 0);
+        }
+
+        let mut decoder = setup();
+        for nal in idr {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.decode_nal(slices[4]).unwrap().unwrap(), 0);
+        for nal in [sps, pps, &unrelated_sps, &unrelated_pps] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        for nal in &slices[5..8] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.decode_nal(slices[8]).unwrap().unwrap(), 1);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 1);
+        for nal in &slices[9..12] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+
+        assert!(decoder.decode_nal(&replacement_sps).unwrap().is_none());
+        assert_frame(decoder.decode_nal(slices[12]).unwrap().unwrap(), 2);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 1);
+        for nal in &slices[13..16] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.flush().unwrap(), 3);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 2);
+    }
+
+    fn multislice_fixture<'a, 'b>(
+        nals: &'a [NalUnit<'b>],
+    ) -> (&'a NalUnit<'b>, &'a NalUnit<'b>, Vec<&'a NalUnit<'b>>) {
+        let sps = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Sps)
+            .unwrap();
+        let pps = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Pps)
+            .unwrap();
+        let slices = nals
+            .iter()
+            .filter(|n| matches!(n.nal_unit_type, NalUnitType::SliceIdr | NalUnitType::Slice))
+            .collect();
+        (sps, pps, slices)
+    }
+
+    #[test]
+    fn test_multislice_incomplete_picture_at_flush_and_boundary() {
+        for (stream, expected) in [
+            (
+                &include_bytes!("../testdata/ms_cavlc_p_test.h264")[..],
+                &include_bytes!("../testdata/ms_cavlc_p_test.yuv")[..],
+            ),
+            (
+                &include_bytes!("../testdata/ms_cabac_p_test.h264")[..],
+                &include_bytes!("../testdata/ms_cabac_p_test.yuv")[..],
+            ),
+        ] {
+            let nals = parse_annex_b(stream);
+            let (sps, pps, slices) = multislice_fixture(&nals);
+            let mut decoder = Decoder::new();
+            for nal in [sps, pps, slices[0]] {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            assert!(decoder.flush().is_none());
+            assert!(decoder.dpb.short_term_ref_list(false, false).is_empty());
+
+            // Reaching the last MB is insufficient when a middle slice is missing.
+            for i in [0, 2, 3, 0, 1, 2, 3] {
+                assert!(decoder.decode_nal(slices[i]).unwrap().is_none());
+            }
+            assert!(decoder.dpb.short_term_ref_list(false, false).is_empty());
+            let frame = decoder.flush().unwrap();
+            assert_eq!((frame.width, frame.height), (64, 64));
+            let actual = [frame.y, frame.u, frame.v].concat();
+            assert_eq!(actual.as_slice(), &expected[..64 * 64 * 3 / 2]);
+        }
+    }
+
+    #[test]
+    fn test_ordered_decoder_uses_returned_picture_sps_depth() {
+        let nals = parse_annex_b(include_bytes!("../testdata/ms_cabac_b_test.h264"));
+        let (sps, pps, slices) = multislice_fixture(&nals);
+        // Same picture syntax as the fixture SPS, with a zero-reorder VUI.
+        let zero_depth = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[
+                0x4d, 0x40, 0x0a, 0xec, 0xa2, 0x13, 0x40, 0x3f, 0x96,
+            ]),
+        };
+        for (old_sps, new_sps, output_count) in [(sps, &zero_depth, 0), (&zero_depth, sps, 1)] {
+            let mut decoder = OrderedDecoder::new();
+            for nal in [old_sps, pps]
+                .into_iter()
+                .chain(slices[..4].iter().copied())
+            {
+                assert!(decoder.decode_nal(nal).unwrap().is_empty());
+            }
+            assert!(decoder.decode_nal(new_sps).unwrap().is_empty());
+            assert_eq!(decoder.decode_nal(slices[4]).unwrap().len(), output_count);
+            // Parameter sets alone cannot drain the picture already in the queue.
+            for nal in [&zero_depth, pps] {
+                assert!(decoder.decode_nal(nal).unwrap().is_empty());
+            }
+            assert_eq!(decoder.flush().len(), 1 - output_count);
+        }
+    }
+
+    #[test]
+    fn test_multislice_sps_replacement_refreshes_inherited_scaling() {
+        let nals = parse_annex_b(include_bytes!("../testdata/ms_cavlc_p_test.h264"));
+        let (sps, pps, slices) = multislice_fixture(&nals);
+        // Same slice syntax, with High-profile SPS default scaling matrices.
+        let scaled = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x64, 0x40, 0x0a, 0xad, 0x00, 0xb4, 0x21, 0x32]),
+        };
+        let decode = |parameter_sets: &[&NalUnit<'_>]| {
+            let mut decoder = Decoder::new();
+            for nal in parameter_sets.iter().chain(&slices[..4]) {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            let frame = decoder.flush().unwrap();
+            [frame.y, frame.u, frame.v]
+        };
+        let original = decode(&[sps, pps]);
+        let fresh = decode(&[&scaled, pps]);
+        assert_ne!(original, fresh);
+
+        let mut decoder = Decoder::new();
+        for nal in [sps, pps].iter().chain(&slices[..4]) {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert!(decoder.decode_nal(&scaled).unwrap().is_none());
+        let previous = decoder.decode_nal(slices[0]).unwrap().unwrap();
+        assert_eq!([previous.y, previous.u, previous.v], original);
+        for nal in &slices[1..4] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        let refreshed = decoder.flush().unwrap();
+        assert_eq!([refreshed.y, refreshed.u, refreshed.v], fresh);
+    }
+
+    #[test]
+    fn test_rejects_unsupported_sps_bit_depth() {
+        // High-profile SPS with bit_depth_luma_minus8 set to one.
+        let sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x64, 0x00, 0x0a, 0xa5, 0x2d, 0x88, 0x4c, 0x80]),
+        };
+        assert!(matches!(
+            Decoder::new().decode_nal(&sps),
+            Err(DecodeError::Unsupported("only 8-bit H.264 is supported"))
+        ));
+    }
+
+    #[test]
+    fn test_mbaff_cropped_picture_uses_coded_geometry() {
+        let nals = parse_annex_b(include_bytes!("../testdata/mbaff_deblock_cavlc_test.h264"));
+        let expected = include_bytes!("../testdata/mbaff_deblock_cavlc_test.yuv");
+        // Keep the coded 64x64 raster and crop 18 right and 20 bottom pixels.
+        let cropped = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x15, 0xf4, 0x22, 0x78, 0xa9, 0x90]),
+        };
+        let mut decoder = Decoder::new();
+        let mut frames = Vec::new();
+        for nal in &nals {
+            let nal = if nal.nal_unit_type == NalUnitType::Sps {
+                &cropped
+            } else {
+                nal
+            };
+            frames.extend(decoder.decode_nal(nal).unwrap());
+        }
+        frames.extend(decoder.flush());
+        frames.sort_by_key(|frame| frame.pic_order_cnt);
+        let reference = expected.chunks_exact(64 * 64 * 3 / 2);
+        assert_eq!(frames.len(), reference.len());
+        for (frame, reference) in frames.into_iter().zip(reference) {
+            assert_eq!((frame.width, frame.height), (46, 44));
+            let (y, chroma) = reference.split_at(64 * 64);
+            let (u, v) = chroma.split_at(32 * 32);
+            for (plane, reference, stride, width, height) in [
+                (frame.y, y, 64, 46, 44),
+                (frame.u, u, 32, 23, 22),
+                (frame.v, v, 32, 23, 22),
+            ] {
+                let rows = reference.chunks_exact(stride).take(height);
+                assert_eq!(plane.len(), width * height);
+                for (actual, expected) in plane.chunks_exact(width).zip(rows) {
+                    assert_eq!(actual, &expected[..width]);
+                }
+            }
+        }
     }
 
     #[test]

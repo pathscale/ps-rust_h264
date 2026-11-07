@@ -6,7 +6,7 @@ use crate::deblock::{MbInfo, MbType};
 use crate::error::DecodeError;
 use crate::inter_pred;
 use crate::intra_pred::predict_chroma_8x8;
-use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
+use crate::mv_pred::{add_mv_diff, predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{compute_nc, dequant_4x4_ac_raster, predict_i4x4_mode};
 use crate::residual::{
     chroma_qp, dequant_4x4_full, dequant_8x8, dequant_chroma_dc, dequant_luma_dc_i16x16,
@@ -15,6 +15,21 @@ use crate::residual::{
     ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CAVLC, ZIGZAG_8X8_CAVLC_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
+
+fn read_mvd(reader: &mut BitstreamReader) -> Result<i16, DecodeError> {
+    i16::try_from(reader.read_se()?)
+        .map_err(|_| DecodeError::InvalidSyntax("CAVLC motion vector difference out of range"))
+}
+
+fn read_mb_qp_delta(reader: &mut BitstreamReader) -> Result<i32, DecodeError> {
+    let delta = reader.read_se()?;
+    if !(-26..=25).contains(&delta) {
+        return Err(DecodeError::InvalidSyntax(
+            "CAVLC macroblock QP delta out of range",
+        ));
+    }
+    Ok(delta)
+}
 
 impl SliceContext<'_> {
     /// Decode a single non-skip CAVLC macroblock (P inter, B inter, or intra).
@@ -90,8 +105,8 @@ impl SliceContext<'_> {
                     } else {
                         0
                     };
-                    let mvd_x = reader.read_se()? as i16;
-                    let mvd_y = reader.read_se()? as i16;
+                    let mvd_x = read_mvd(reader)?;
+                    let mvd_y = read_mvd(reader)?;
 
                     // MV prediction using the appropriate store
                     let (mv_store_ref, ref_store_ref): (&[[i16; 2]], &[i8]) = if is_l0 {
@@ -115,7 +130,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                    let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
 
                     // Store MV/ref for all 4x4 blocks
                     for blk in 0..16 {
@@ -213,8 +228,8 @@ impl SliceContext<'_> {
                         0
                     };
 
-                    let mvd_l0_x = reader.read_se()? as i16;
-                    let mvd_l0_y = reader.read_se()? as i16;
+                    let mvd_l0_x = read_mvd(reader)?;
+                    let mvd_l0_y = read_mvd(reader)?;
                     let (mvp_l0_x, mvp_l0_y) = predict_mv(
                         self.mv_store_l0,
                         self.ref_idx_store_l0,
@@ -231,10 +246,10 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv_l0 = [mvp_l0_x + mvd_l0_x, mvp_l0_y + mvd_l0_y];
+                    let mv_l0 = add_mv_diff((mvp_l0_x, mvp_l0_y), [mvd_l0_x, mvd_l0_y]);
 
-                    let mvd_l1_x = reader.read_se()? as i16;
-                    let mvd_l1_y = reader.read_se()? as i16;
+                    let mvd_l1_x = read_mvd(reader)?;
+                    let mvd_l1_y = read_mvd(reader)?;
                     let (mvp_l1_x, mvp_l1_y) = predict_mv(
                         self.mv_store_l1,
                         self.ref_idx_store_l1,
@@ -251,7 +266,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv_l1 = [mvp_l1_x + mvd_l1_x, mvp_l1_y + mvd_l1_y];
+                    let mv_l1 = add_mv_diff((mvp_l1_x, mvp_l1_y), [mvd_l1_x, mvd_l1_y]);
 
                     // Store both L0 and L1 MVs
                     for blk in 0..16 {
@@ -348,8 +363,8 @@ impl SliceContext<'_> {
                                     self.ref_idx_store_l0[mb_idx * 16 + blk] = part_ref_l0[p];
                                 }
                             }
-                            let mvd_x = reader.read_se()? as i16;
-                            let mvd_y = reader.read_se()? as i16;
+                            let mvd_x = read_mvd(reader)?;
+                            let mvd_y = read_mvd(reader)?;
                             let (mvp_x, mvp_y) = predict_mv(
                                 self.mv_store_l0,
                                 self.ref_idx_store_l0,
@@ -366,7 +381,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l0_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l0_parts[p] = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             // Store MV immediately for partition 1 to read partition 0
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
@@ -390,8 +405,8 @@ impl SliceContext<'_> {
                                     self.ref_idx_store_l1[mb_idx * 16 + blk] = part_ref_l1[p];
                                 }
                             }
-                            let mvd_x = reader.read_se()? as i16;
-                            let mvd_y = reader.read_se()? as i16;
+                            let mvd_x = read_mvd(reader)?;
+                            let mvd_y = read_mvd(reader)?;
                             let (mvp_x, mvp_y) = predict_mv(
                                 self.mv_store_l1,
                                 self.ref_idx_store_l1,
@@ -408,7 +423,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l1_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l1_parts[p] = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
                                     let lr = (py_off + r) / 4;
@@ -605,8 +620,8 @@ impl SliceContext<'_> {
                             if layout.pl0 {
                                 let px = layout.sx + dx;
                                 let py = layout.sy + dy;
-                                let mvd_x = reader.read_se()? as i16;
-                                let mvd_y = reader.read_se()? as i16;
+                                let mvd_x = read_mvd(reader)?;
+                                let mvd_y = read_mvd(reader)?;
                                 let (mvp_x, mvp_y) = predict_mv_sub(
                                     self.mv_store_l0,
                                     self.ref_idx_store_l0,
@@ -624,7 +639,7 @@ impl SliceContext<'_> {
                                         mb_field_decoding: self.mb_field_decoding,
                                     },
                                 );
-                                let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                                let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                                 sub_mvs[idx].mv_l0 = mv;
                                 // Store immediately for subsequent sub-partition prediction
                                 for r in (0..layout.sub_h).step_by(4) {
@@ -651,8 +666,8 @@ impl SliceContext<'_> {
                             if layout.pl1 {
                                 let px = layout.sx + dx;
                                 let py = layout.sy + dy;
-                                let mvd_x = reader.read_se()? as i16;
-                                let mvd_y = reader.read_se()? as i16;
+                                let mvd_x = read_mvd(reader)?;
+                                let mvd_y = read_mvd(reader)?;
                                 let (mvp_x, mvp_y) = predict_mv_sub(
                                     self.mv_store_l1,
                                     self.ref_idx_store_l1,
@@ -670,7 +685,7 @@ impl SliceContext<'_> {
                                         mb_field_decoding: self.mb_field_decoding,
                                     },
                                 );
-                                let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                                let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                                 sub_mvs[idx].mv_l1 = mv;
                                 for r in (0..layout.sub_h).step_by(4) {
                                     for c in (0..layout.sub_w).step_by(4) {
@@ -782,7 +797,7 @@ impl SliceContext<'_> {
                 && reader.read_bit()? != 0;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = read_mb_qp_delta(reader)?;
                 ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52
             } else {
                 self.prev_mb_qp
@@ -1346,8 +1361,8 @@ impl SliceContext<'_> {
                     for &(dx, dy, spw, sph) in &sub_parts_layout {
                         let px = sx + dx;
                         let py = sy + dy;
-                        let mvd_x = reader.read_se()? as i16;
-                        let mvd_y = reader.read_se()? as i16;
+                        let mvd_x = read_mvd(reader)?;
+                        let mvd_y = read_mvd(reader)?;
                         let (mvp_x, mvp_y) = predict_mv_sub(
                             self.mv_store_l0,
                             self.ref_idx_store_l0,
@@ -1365,7 +1380,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                         // Store MV for all 4x4 blocks in this sub-partition
                         for r in (0..sph).step_by(4) {
                             for c in (0..spw).step_by(4) {
@@ -1406,8 +1421,8 @@ impl SliceContext<'_> {
 
                 #[allow(clippy::needless_range_loop)]
                 for p in 0..num_parts {
-                    let mvd_x = reader.read_se()? as i16;
-                    let mvd_y = reader.read_se()? as i16;
+                    let mvd_x = read_mvd(reader)?;
+                    let mvd_y = read_mvd(reader)?;
                     let (mvp_x, mvp_y) = predict_mv(
                         self.mv_store_l0,
                         self.ref_idx_store_l0,
@@ -1424,7 +1439,7 @@ impl SliceContext<'_> {
                             mb_field_decoding: self.mb_field_decoding,
                         },
                     );
-                    let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                    let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                     let (py_off, px_off) = match mb_type {
                         1 => (p * 8, 0),
                         2 => (0, p * 8),
@@ -1474,7 +1489,7 @@ impl SliceContext<'_> {
                 && reader.read_bit()? != 0;
 
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = read_mb_qp_delta(reader)?;
                 ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52
             } else {
                 self.prev_mb_qp
@@ -1910,7 +1925,7 @@ impl SliceContext<'_> {
             cbp_chroma = cbp >> 4;
 
             if cbp_luma != 0 || cbp_chroma != 0 {
-                let mb_qp_delta = reader.read_se()?;
+                let mb_qp_delta = read_mb_qp_delta(reader)?;
                 qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
             } else {
                 qp_y = self.prev_mb_qp;
@@ -2034,7 +2049,7 @@ impl SliceContext<'_> {
 
             intra_chroma_pred_mode = reader.read_ue()? as u8;
 
-            let mb_qp_delta = reader.read_se()?;
+            let mb_qp_delta = read_mb_qp_delta(reader)?;
             qp_y = ((self.prev_mb_qp + mb_qp_delta + 52) % 52 + 52) % 52;
             self.prev_mb_qp = qp_y;
             qp_c = chroma_qp(qp_y, sp.chroma_qp_index_offset);

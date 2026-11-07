@@ -33,6 +33,15 @@ pub struct Pps {
 /// Parse a PPS from RBSP data (NAL header byte already stripped).
 /// `sps` is needed to inherit scaling lists when PPS doesn't override them.
 pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
+    parse_pps_with_len(rbsp, sps).map(|(pps, _)| pps)
+}
+
+// Keep only the PPS syntax and the byte containing its RBSP stop bit when
+// caching the bytes needed to resolve this PPS against a replacement SPS.
+pub(crate) fn parse_pps_with_len(
+    rbsp: &[u8],
+    sps: Option<&Sps>,
+) -> Result<(Pps, usize), &'static str> {
     let mut r = BitstreamReader::new(rbsp);
 
     let pic_parameter_set_id = r.read_ue()?;
@@ -51,11 +60,23 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
 
     let num_ref_idx_l0_default_active_minus1 = r.read_ue()?;
     let num_ref_idx_l1_default_active_minus1 = r.read_ue()?;
+    if num_ref_idx_l0_default_active_minus1 > 31 || num_ref_idx_l1_default_active_minus1 > 31 {
+        return Err("PPS default reference count out of range");
+    }
     let weighted_pred_flag = r.read_bit()? != 0;
     let weighted_bipred_idc = r.read_bits(2)? as u8;
     let pic_init_qp_minus26 = r.read_se()?;
     let pic_init_qs_minus26 = r.read_se()?;
     let chroma_qp_index_offset = r.read_se()?;
+    let qp_bd_offset = 6 * i64::from(sps.map_or(0, |s| s.bit_depth_luma_minus8));
+    if !(-26 - qp_bd_offset..=25).contains(&i64::from(pic_init_qp_minus26))
+        || !(-26..=25).contains(&pic_init_qs_minus26)
+    {
+        return Err("PPS initial quantizer out of range");
+    }
+    if !(-12..=12).contains(&chroma_qp_index_offset) {
+        return Err("PPS chroma QP offset out of range");
+    }
     let deblocking_filter_control_present_flag = r.read_bit()? != 0;
     let constrained_intra_pred_flag = r.read_bit()? != 0;
     let redundant_pic_cnt_present_flag = r.read_bit()? != 0;
@@ -98,9 +119,12 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
             }
         }
         second_chroma_qp_index_offset = r.read_se()?;
+        if !(-12..=12).contains(&second_chroma_qp_index_offset) {
+            return Err("PPS second chroma QP offset out of range");
+        }
     }
 
-    Ok(Pps {
+    let pps = Pps {
         pic_parameter_set_id,
         seq_parameter_set_id,
         entropy_coding_mode_flag,
@@ -121,7 +145,13 @@ pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
         second_chroma_qp_index_offset,
         scaling_list_4x4,
         scaling_list_8x8,
-    })
+    };
+    let (byte, bit) = r.position();
+    let trailing = *rbsp.get(byte).ok_or("missing PPS RBSP stop bit")?;
+    if trailing & (u8::MAX >> bit) != 0x80 >> bit {
+        return Err("invalid PPS RBSP trailing bits");
+    }
+    Ok((pps, byte + 1))
 }
 
 #[cfg(test)]

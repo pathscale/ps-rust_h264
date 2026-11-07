@@ -5,7 +5,7 @@ use crate::cabac::CabacReader;
 use crate::deblock::{MbInfo, MbType};
 use crate::error::DecodeError;
 use crate::inter_pred;
-use crate::mv_pred::{predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
+use crate::mv_pred::{add_mv_diff, predict_mv, predict_mv_sub, ref_pic_safe, MbaffCtx};
 use crate::neighbor::{
     cabac_amvd, cabac_neighbor_nz_chroma, cabac_neighbor_nz_luma, cabac_neighbor_ref,
     dequant_4x4_ac_raster, predict_i4x4_mode,
@@ -320,7 +320,7 @@ impl SliceContext<'_> {
                     self.mb_cbp[mb_idx] = (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
 
                     let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                        let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                        let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
                         self.last_qp_delta_nonzero = delta != 0;
                         ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
                     } else {
@@ -342,7 +342,7 @@ impl SliceContext<'_> {
                                     5,
                                     64,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 let tc_per = tc.div_ceil(4);
                                 for sub in 0..4 {
                                     self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
@@ -413,7 +413,7 @@ impl SliceContext<'_> {
                                         2,
                                         16,
                                         self.is_field_coded(mb_idx),
-                                    );
+                                    )?;
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
                                     for (pos, val) in &coeffs {
                                         let (r, c) = zigzag_4x4[*pos];
@@ -476,7 +476,7 @@ impl SliceContext<'_> {
                                 3,
                                 4,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             for (p, v) in coeffs {
                                 chroma_dc_cb[p] = v;
                             }
@@ -499,7 +499,7 @@ impl SliceContext<'_> {
                                 3,
                                 4,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             for (p, v) in coeffs {
                                 chroma_dc_cr[p] = v;
                             }
@@ -542,7 +542,7 @@ impl SliceContext<'_> {
                                     4,
                                     15,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 self.nc_cb[mb_idx * 4 + blk] = tc;
                                 for (p, v) in coeffs {
                                     chroma_ac_cb[blk][p] = v;
@@ -580,7 +580,7 @@ impl SliceContext<'_> {
                                     4,
                                     15,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 self.nc_cr[mb_idx * 4 + blk] = tc;
                                 for (p, v) in coeffs {
                                     chroma_ac_cr[blk][p] = v;
@@ -639,7 +639,7 @@ impl SliceContext<'_> {
                     let intra_chroma_pred_mode = cr.decode_chroma_pred_mode(st, left_cm, top_cm);
                     self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
 
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
                     self.last_qp_delta_nonzero = delta != 0;
                     let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
                     self.prev_mb_qp = qp_y;
@@ -659,7 +659,7 @@ impl SliceContext<'_> {
                     };
                     if cr.decode_coded_block_flag(st, 0, dc_left_nz, dc_top_nz) {
                         let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx))?;
                         for (p, v) in coeffs {
                             luma_dc[p] = v;
                         }
@@ -700,7 +700,7 @@ impl SliceContext<'_> {
                                     1,
                                     15,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 self.nc_luma[mb_idx * 16 + blk] = tc;
                                 for (p, v) in coeffs {
                                     luma_ac[blk][p] = v;
@@ -786,7 +786,7 @@ impl SliceContext<'_> {
                                 3,
                                 4,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             for (p, v) in coeffs {
                                 chroma_dc_cb[p] = v;
                             }
@@ -808,7 +808,7 @@ impl SliceContext<'_> {
                                 3,
                                 4,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             for (p, v) in coeffs {
                                 chroma_dc_cr[p] = v;
                             }
@@ -851,7 +851,7 @@ impl SliceContext<'_> {
                                     4,
                                     15,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 self.nc_cb[mb_idx * 4 + blk] = tc;
                                 for (p, v) in coeffs {
                                     chroma_ac_cb[blk][p] = v;
@@ -889,7 +889,7 @@ impl SliceContext<'_> {
                                     4,
                                     15,
                                     self.is_field_coded(mb_idx),
-                                );
+                                )?;
                                 self.nc_cr[mb_idx * 4 + blk] = tc;
                                 for (p, v) in coeffs {
                                     chroma_ac_cr[blk][p] = v;
@@ -1079,8 +1079,8 @@ impl SliceContext<'_> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                             let (mvp_x, mvp_y) = predict_mv_sub(
                                 self.mv_store_l0,
                                 self.ref_idx_store_l0,
@@ -1098,7 +1098,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             for r in (0..sph).step_by(4) {
                                 for c in (0..spw).step_by(4) {
                                     let lr = (py + r) / 4;
@@ -1310,8 +1310,8 @@ impl SliceContext<'_> {
                             self.mbaff,
                             self.mb_field_decoding,
                         );
-                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                         let (mvp_x, mvp_y) = predict_mv(
                             self.mv_store_l0,
                             self.ref_idx_store_l0,
@@ -1328,7 +1328,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                         // Store MV, ref, and MVD
                         for r in (0..part_h).step_by(4) {
                             for c in (0..part_w).step_by(4) {
@@ -1475,7 +1475,7 @@ impl SliceContext<'_> {
                 self.mb_is_8x8dct[mb_idx] = use_8x8_inter;
 
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
                     self.last_qp_delta_nonzero = delta != 0;
                     ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
                 } else {
@@ -1500,7 +1500,7 @@ impl SliceContext<'_> {
                                 5,
                                 64,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             let tc_per = tc.div_ceil(4);
                             for sub in 0..4 {
                                 self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
@@ -1555,7 +1555,7 @@ impl SliceContext<'_> {
                                         2,
                                         16,
                                         self.is_field_coded(mb_idx),
-                                    );
+                                    )?;
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
                                     let mut block_coeffs = [0i32; 16];
                                     for (pos, val) in &coeffs {
@@ -1608,7 +1608,7 @@ impl SliceContext<'_> {
                     };
                     if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
                         let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                         for (pos, val) in coeffs {
                             chroma_dc_cb[pos] = val;
                         }
@@ -1626,7 +1626,7 @@ impl SliceContext<'_> {
                     };
                     if cr.decode_coded_block_flag(st, 3, left_dc_cr, top_dc_cr) {
                         let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                         for (pos, val) in coeffs {
                             chroma_dc_cr[pos] = val;
                         }
@@ -1682,7 +1682,7 @@ impl SliceContext<'_> {
                                 );
                                 if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                                     let (coeffs, tc) =
-                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb);
+                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb)?;
                                     if scale_idx == 4 {
                                         self.nc_cb[mb_idx * 4 + blk] = tc;
                                     } else {
@@ -1925,8 +1925,8 @@ impl SliceContext<'_> {
                             self.mbaff,
                             self.mb_field_decoding,
                         );
-                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                         let (mvp_x, mvp_y) = predict_mv(
                             self.mv_store_l0,
                             self.ref_idx_store_l0,
@@ -1943,7 +1943,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        mv_l0 = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        mv_l0 = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                         for blk in 0..16 {
                             self.mv_store_l0[mb_idx * 16 + blk] = mv_l0;
                             self.ref_idx_store_l0[mb_idx * 16 + blk] = ref_l0;
@@ -1975,8 +1975,8 @@ impl SliceContext<'_> {
                             self.mbaff,
                             self.mb_field_decoding,
                         );
-                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                        let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                        let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                         let (mvp_x, mvp_y) = predict_mv(
                             self.mv_store_l1,
                             self.ref_idx_store_l1,
@@ -1993,7 +1993,7 @@ impl SliceContext<'_> {
                                 mb_field_decoding: self.mb_field_decoding,
                             },
                         );
-                        mv_l1 = [mvp_x + mvd_x, mvp_y + mvd_y];
+                        mv_l1 = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                         for blk in 0..16 {
                             self.mv_store_l1[mb_idx * 16 + blk] = mv_l1;
                             self.ref_idx_store_l1[mb_idx * 16 + blk] = ref_l1;
@@ -2151,8 +2151,8 @@ impl SliceContext<'_> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                             let (mvp_x, mvp_y) = predict_mv(
                                 self.mv_store_l0,
                                 self.ref_idx_store_l0,
@@ -2169,7 +2169,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l0_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l0_parts[p] = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             // Store MV and MVD immediately for partition 1 prediction
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
@@ -2234,8 +2234,8 @@ impl SliceContext<'_> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                             let (mvp_x, mvp_y) = predict_mv(
                                 self.mv_store_l1,
                                 self.ref_idx_store_l1,
@@ -2252,7 +2252,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            mv_l1_parts[p] = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            mv_l1_parts[p] = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             for r in (0..part_h).step_by(4) {
                                 for c in (0..part_w).step_by(4) {
                                     let lr = (py_off + r) / 4;
@@ -2534,8 +2534,8 @@ impl SliceContext<'_> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                             let (mvp_x, mvp_y) = predict_mv_sub(
                                 self.mv_store_l0,
                                 self.ref_idx_store_l0,
@@ -2553,7 +2553,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             for r in (0..layout.sub_h).step_by(4) {
                                 for c in (0..layout.sub_w).step_by(4) {
                                     let lr = (py + r) / 4;
@@ -2615,8 +2615,8 @@ impl SliceContext<'_> {
                                 self.mbaff,
                                 self.mb_field_decoding,
                             );
-                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x) as i16;
-                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y) as i16;
+                            let mvd_x = cr.decode_mvd_comp(st, 40, amvd_x)?;
+                            let mvd_y = cr.decode_mvd_comp(st, 47, amvd_y)?;
                             let (mvp_x, mvp_y) = predict_mv_sub(
                                 self.mv_store_l1,
                                 self.ref_idx_store_l1,
@@ -2634,7 +2634,7 @@ impl SliceContext<'_> {
                                     mb_field_decoding: self.mb_field_decoding,
                                 },
                             );
-                            let mv = [mvp_x + mvd_x, mvp_y + mvd_y];
+                            let mv = add_mv_diff((mvp_x, mvp_y), [mvd_x, mvd_y]);
                             for r in (0..layout.sub_h).step_by(4) {
                                 for c in (0..layout.sub_w).step_by(4) {
                                     let lr = (py + r) / 4;
@@ -3082,7 +3082,7 @@ impl SliceContext<'_> {
                 self.mb_is_8x8dct[mb_idx] = use_8x8_b_inter;
 
                 let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                    let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
                     self.last_qp_delta_nonzero = delta != 0;
                     ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
                 } else {
@@ -3106,7 +3106,7 @@ impl SliceContext<'_> {
                                 5,
                                 64,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             let tc_per = tc.div_ceil(4);
                             for sub in 0..4 {
                                 self.nc_luma[mb_idx * 16 + i8x8 * 4 + sub] = tc_per;
@@ -3159,7 +3159,7 @@ impl SliceContext<'_> {
                                         2,
                                         16,
                                         self.is_field_coded(mb_idx),
-                                    );
+                                    )?;
                                     self.nc_luma[mb_idx * 16 + blk] = tc;
                                     let mut block_coeffs = [0i32; 16];
                                     for (pos, val) in &coeffs {
@@ -3211,7 +3211,7 @@ impl SliceContext<'_> {
                     };
                     if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
                         let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                         for (pos, val) in coeffs {
                             chroma_dc_cb[pos] = val;
                         }
@@ -3229,7 +3229,7 @@ impl SliceContext<'_> {
                     };
                     if cr.decode_coded_block_flag(st, 3, left_dc_cr, top_dc_cr) {
                         let (coeffs, _) =
-                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                         for (pos, val) in coeffs {
                             chroma_dc_cr[pos] = val;
                         }
@@ -3285,7 +3285,7 @@ impl SliceContext<'_> {
                                 );
                                 if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                                     let (coeffs, tc) =
-                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb);
+                                        cr.decode_residual_cabac_field(st, 4, 15, is_field_mb)?;
                                     if scale_idx == 4 {
                                         self.nc_cb[mb_idx * 4 + blk] = tc;
                                     } else {
@@ -3472,7 +3472,7 @@ impl SliceContext<'_> {
             let cbp_chroma = cr.decode_cbp_chroma(st, left_cbp_c, top_cbp_c);
             self.mb_cbp[mb_idx] = (cbp_luma as u16) | ((cbp_chroma as u16) << 4);
             let qp_y = if cbp_luma != 0 || cbp_chroma != 0 {
-                let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+                let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
                 self.last_qp_delta_nonzero = delta != 0;
                 ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52
             } else {
@@ -3523,7 +3523,7 @@ impl SliceContext<'_> {
                     }
                     // cat=5: no coded_block_flag, CBP bit is sufficient
                     let (coeffs, tc) =
-                        cr.decode_residual_cabac_field(st, 5, 64, self.is_field_coded(mb_idx));
+                        cr.decode_residual_cabac_field(st, 5, 64, self.is_field_coded(mb_idx))?;
                     // Distribute nC across sub-blocks
                     let tc_per = tc.div_ceil(4);
                     for sub in 0..4 {
@@ -3597,7 +3597,7 @@ impl SliceContext<'_> {
                                 2,
                                 16,
                                 self.is_field_coded(mb_idx),
-                            );
+                            )?;
                             self.nc_luma[mb_idx * 16 + blk] = tc;
                             for (pos, val) in &coeffs {
                                 let (r, c) = zigzag_4x4[*pos];
@@ -3656,7 +3656,7 @@ impl SliceContext<'_> {
                 };
                 if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
                     let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                     for (pos, val) in coeffs {
                         chroma_dc_cb[pos] = val;
                     }
@@ -3674,7 +3674,7 @@ impl SliceContext<'_> {
                 };
                 if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
                     let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                     for (pos, val) in coeffs {
                         chroma_dc_cr[pos] = val;
                     }
@@ -3712,7 +3712,7 @@ impl SliceContext<'_> {
                     );
                     if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                         let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx))?;
                         self.nc_cb[mb_idx * 4 + blk] = tc;
                         for (pos, val) in coeffs {
                             chroma_ac_cb[blk][pos] = val;
@@ -3746,7 +3746,7 @@ impl SliceContext<'_> {
                     );
                     if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                         let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx))?;
                         self.nc_cr[mb_idx * 4 + blk] = tc;
                         for (pos, val) in coeffs {
                             chroma_ac_cr[blk][pos] = val;
@@ -3807,7 +3807,7 @@ impl SliceContext<'_> {
             };
             let intra_chroma_pred_mode = cr.decode_chroma_pred_mode(st, left_cm, top_cm);
             self.mb_chroma_pred[mb_idx] = intra_chroma_pred_mode;
-            let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero);
+            let delta = cr.decode_mb_qp_delta(st, self.last_qp_delta_nonzero)?;
             self.last_qp_delta_nonzero = delta != 0;
             let qp_y = ((self.prev_mb_qp + delta + 52) % 52 + 52) % 52;
             self.prev_mb_qp = qp_y;
@@ -3827,7 +3827,7 @@ impl SliceContext<'_> {
             };
             if cr.decode_coded_block_flag(st, 0, dc_left_nz, dc_top_nz) {
                 let (coeffs, _tc) =
-                    cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx));
+                    cr.decode_residual_cabac_field(st, 0, 16, self.is_field_coded(mb_idx))?;
                 for (pos, val) in coeffs {
                     luma_dc[pos] = val;
                 }
@@ -3864,7 +3864,7 @@ impl SliceContext<'_> {
                     );
                     if cr.decode_coded_block_flag(st, 1, left_nz, top_nz) {
                         let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 1, 15, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 1, 15, self.is_field_coded(mb_idx))?;
                         self.nc_luma[mb_idx * 16 + blk] = tc;
                         for (pos, val) in coeffs {
                             luma_ac_scan[blk][pos] = val;
@@ -3947,7 +3947,7 @@ impl SliceContext<'_> {
                 };
                 if cr.decode_coded_block_flag(st, 3, left_dc_nz, top_dc_nz) {
                     let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                     for (pos, val) in coeffs {
                         chroma_dc_cb[pos] = val;
                     }
@@ -3965,7 +3965,7 @@ impl SliceContext<'_> {
                 };
                 if cr.decode_coded_block_flag(st, 3, left_dc_nz_cr, top_dc_nz_cr) {
                     let (coeffs, _tc) =
-                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx));
+                        cr.decode_residual_cabac_field(st, 3, 4, self.is_field_coded(mb_idx))?;
                     for (pos, val) in coeffs {
                         chroma_dc_cr[pos] = val;
                     }
@@ -4002,7 +4002,7 @@ impl SliceContext<'_> {
                     );
                     if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                         let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx))?;
                         self.nc_cb[mb_idx * 4 + blk] = tc;
                         for (pos, val) in coeffs {
                             chroma_ac_cb[blk][pos] = val;
@@ -4036,7 +4036,7 @@ impl SliceContext<'_> {
                     );
                     if cr.decode_coded_block_flag(st, 4, left_nz, top_nz) {
                         let (coeffs, tc) =
-                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx));
+                            cr.decode_residual_cabac_field(st, 4, 15, self.is_field_coded(mb_idx))?;
                         self.nc_cr[mb_idx * 4 + blk] = tc;
                         for (pos, val) in coeffs {
                             chroma_ac_cr[blk][pos] = val;

@@ -489,7 +489,7 @@ pub(crate) fn derive_spatial_direct_blk(
                 } else {
                     [0, 0]
                 };
-                col_mv[0].abs() <= 1 && col_mv[1].abs() <= 1
+                col_mv[0].unsigned_abs() <= 1 && col_mv[1].unsigned_abs() <= 1
             } else if col_ref_l0 < 0
                 && col_pos < col.ref_idx_l1.len()
                 && col.ref_idx_l1[col_pos] == 0
@@ -499,7 +499,7 @@ pub(crate) fn derive_spatial_direct_blk(
                 } else {
                     [0, 0]
                 };
-                col_mv_l1[0].abs() <= 1 && col_mv_l1[1].abs() <= 1
+                col_mv_l1[0].unsigned_abs() <= 1 && col_mv_l1[1].unsigned_abs() <= 1
             } else {
                 false
             };
@@ -595,8 +595,8 @@ pub(crate) fn derive_temporal_direct_blk(
         .pic_order_cnt;
 
     // Compute dist_scale_factor: td = col_poc - poc0, tb = current_poc - poc0
-    let td = (col_poc - poc0).clamp(-128, 127);
-    let tb = (current_poc - poc0).clamp(-128, 127);
+    let td = (i64::from(col_poc) - i64::from(poc0)).clamp(-128, 127) as i32;
+    let tb = (i64::from(current_poc) - i64::from(poc0)).clamp(-128, 127) as i32;
 
     let (mv_l0, mv_l1) = if td == 0 {
         // No scaling possible
@@ -606,12 +606,17 @@ pub(crate) fn derive_temporal_direct_blk(
         let scale = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
         let mx_l0 = ((scale * col_mv[0] as i32 + 128) >> 8) as i16;
         let my_l0 = ((scale * col_mv[1] as i32 + 128) >> 8) as i16;
-        let mx_l1 = mx_l0 - col_mv[0];
-        let my_l1 = my_l0 - col_mv[1];
+        let mx_l1 = mx_l0.wrapping_sub(col_mv[0]);
+        let my_l1 = my_l0.wrapping_sub(col_mv[1]);
         ([mx_l0, my_l0], [mx_l1, my_l1])
     };
 
     Ok((mv_l0, mv_l1, ref0 as i8, 0, true, true))
+}
+
+/// Reconstruct signed 16-bit motion vector components (spec 8.4.1.3).
+pub(crate) fn add_mv_diff((x, y): (i16, i16), diff: [i16; 2]) -> [i16; 2] {
+    [x.wrapping_add(diff[0]), y.wrapping_add(diff[1])]
 }
 
 /// Motion vector prediction using the median of neighbors A, B, C (spec 8.4.1.3).

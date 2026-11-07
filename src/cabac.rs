@@ -487,7 +487,7 @@ impl CabacReader<'_> {
         cat: usize,
         max_coeff: usize,
         field_coded: bool,
-    ) -> (Vec<(usize, i32)>, u8) {
+    ) -> Result<(Vec<(usize, i32)>, u8), &'static str> {
         let sig_base = if field_coded {
             SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET[cat]
         } else {
@@ -532,7 +532,7 @@ impl CabacReader<'_> {
         }
 
         if sig_positions.is_empty() {
-            return (vec![], 0);
+            return Ok((vec![], 0));
         }
 
         let coeff_count = sig_positions.len() as u8;
@@ -562,7 +562,10 @@ impl CabacReader<'_> {
                 if abs_val >= 15 {
                     // Exponential-Golomb bypass for large values
                     let mut k = 0u32;
-                    while self.get_cabac_bypass() != 0 && k < 23 {
+                    while self.get_cabac_bypass() != 0 {
+                        if k == 23 {
+                            return Err("CABAC coefficient level prefix out of range");
+                        }
                         k += 1;
                     }
                     let mut val = 1u32;
@@ -584,7 +587,7 @@ impl CabacReader<'_> {
         // Reverse to put in scan order (low freq first)
         coeffs.reverse();
 
-        (coeffs, coeff_count)
+        Ok((coeffs, coeff_count))
     }
 }
 
@@ -871,7 +874,12 @@ impl CabacReader<'_> {
     /// Decode motion vector difference component (spec 9.3.3.1.1.7).
     /// `ctx_base`: 40 for X, 47 for Y.
     /// `amvd`: sum of absolute MVD values from left and top neighbors.
-    pub fn decode_mvd_comp(&mut self, state: &mut [u8; 1024], ctx_base: usize, amvd: u32) -> i32 {
+    pub fn decode_mvd_comp(
+        &mut self,
+        state: &mut [u8; 1024],
+        ctx_base: usize,
+        amvd: u32,
+    ) -> Result<i16, &'static str> {
         // Context selection based on sum of neighbor MVDs
         let ctx_offset = if amvd < 3 {
             0
@@ -883,11 +891,11 @@ impl CabacReader<'_> {
         let ctx = ctx_base + ctx_offset;
 
         if self.get_cabac(&mut state[ctx]) == 0 {
-            return 0;
+            return Ok(0);
         }
 
         // Unary coding for magnitude 1-8
-        let mut abs_mvd = 1u32;
+        let mut abs_mvd = 1i32;
         let mut uctx = ctx_base + 3;
         while abs_mvd < 9 && self.get_cabac(&mut state[uctx]) != 0 {
             if abs_mvd < 4 {
@@ -901,16 +909,20 @@ impl CabacReader<'_> {
             let mut k = 3u32;
             while self.get_cabac_bypass() != 0 {
                 abs_mvd += 1 << k;
+                if abs_mvd > -i32::from(i16::MIN) {
+                    return Err("CABAC motion vector difference out of range");
+                }
                 k += 1;
             }
             while k > 0 {
                 k -= 1;
-                abs_mvd += self.get_cabac_bypass() << k;
+                abs_mvd += (self.get_cabac_bypass() as i32) << k;
             }
         }
 
         // Sign via bypass
-        self.get_cabac_bypass_sign(-(abs_mvd as i32))
+        i16::try_from(self.get_cabac_bypass_sign(-abs_mvd))
+            .map_err(|_| "CABAC motion vector difference out of range")
     }
 
     /// Decode QP delta (spec 9.3.3.1.1.5).
@@ -919,10 +931,10 @@ impl CabacReader<'_> {
         &mut self,
         state: &mut [u8; 1024],
         last_qp_delta_nonzero: bool,
-    ) -> i32 {
+    ) -> Result<i32, &'static str> {
         let ctx = 60 + last_qp_delta_nonzero as usize;
         if self.get_cabac(&mut state[ctx]) == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let mut val = 1u32;
@@ -931,16 +943,20 @@ impl CabacReader<'_> {
             uctx = 63;
             val += 1;
             if val > 52 {
-                break;
+                return Err("CABAC macroblock QP delta out of range");
             }
         }
 
         // Convert unary to signed: 1->1, 2->-1, 3->2, 4->-2, ...
-        if val & 1 != 0 {
+        let delta = if val & 1 != 0 {
             ((val + 1) >> 1) as i32
         } else {
-            -(((val + 1) >> 1) as i32)
+            -((val >> 1) as i32)
+        };
+        if delta > 25 {
+            return Err("CABAC macroblock QP delta out of range");
         }
+        Ok(delta)
     }
 
     /// Decode coded_block_flag for a block (spec 9.3.3.1.1.9).

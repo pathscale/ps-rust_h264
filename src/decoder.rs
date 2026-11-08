@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use crate::dpb::{DecodedPicture, Dpb, ReferenceStatus};
 use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
-use crate::pps::{parse_pps, Pps};
+use crate::pps::{parse_pps, parse_pps_with_len, Pps};
 use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::slice_setup::{self, ReferenceLists};
@@ -42,10 +43,151 @@ pub struct Frame {
     pub pic_order_cnt: i32,
 }
 
+// A slice ID distinct from every successfully decoded macroblock.
+const UNDECODED_MB: u16 = u16::MAX;
+
+const DEFAULT_PICTURE_MEMORY_LIMIT: usize = 768 * 1024 * 1024;
+const PICTURE_MEMORY_ERROR: DecodeError = DecodeError::Unsupported("picture memory budget exceeded");
+
+struct PictureLayout {
+    width: u32,
+    height: u32,
+    frame_height: u32,
+    mb_width: u32,
+    mb_height: u32,
+    total_mbs: usize,
+    coded_luma: usize,
+}
+
+impl PictureLayout {
+    fn new(sps: &Sps, field: bool) -> Result<Self, DecodeError> {
+        const INVALID_CODED_DIMENSIONS: DecodeError =
+            DecodeError::InvalidSyntax("SPS coded dimensions out of range");
+        const MAX_MBS_PER_AXIS: u32 = 16384 / 16;
+
+        let mb_width = sps
+            .pic_width_in_mbs_minus1
+            .checked_add(1)
+            .ok_or(INVALID_CODED_DIMENSIONS)?;
+        let height_scale = if sps.frame_mbs_only_flag || field { 1 } else { 2 };
+        let mb_height = sps
+            .pic_height_in_map_units_minus1
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(height_scale))
+            .ok_or(INVALID_CODED_DIMENSIONS)?;
+        // Bound the coded raster before using the SPS crop-adjusted dimensions.
+        if mb_width > MAX_MBS_PER_AXIS || mb_height > MAX_MBS_PER_AXIS {
+            return Err(INVALID_CODED_DIMENSIONS);
+        }
+        let width = sps.width();
+        let frame_height = sps.height();
+        let height = if field { frame_height / 2 } else { frame_height };
+        if width == 0 || height == 0 || width > 16384 || frame_height > 16384 {
+            return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
+        }
+        let total_mbs = (mb_width as usize)
+            .checked_mul(mb_height as usize)
+            .ok_or(PICTURE_MEMORY_ERROR)?;
+        let coded_luma = total_mbs.checked_mul(16 * 16).ok_or(PICTURE_MEMORY_ERROR)?;
+        Ok(Self {
+            width,
+            height,
+            frame_height,
+            mb_width,
+            mb_height,
+            total_mbs,
+            coded_luma,
+        })
+    }
+
+    fn peak_bytes(
+        &self,
+        header: &SliceHeader,
+        dpb: &Dpb,
+        pending_field: Option<&DecodedOutput>,
+        boundary_output: Option<&DecodedOutput>,
+    ) -> Option<usize> {
+        // Match the raster-sized arrays in PictureState's allocation below.
+        // Per 4x4 block: nc_luma, four MV/MVD stores, two reference indices,
+        // reference POC, i4x4 mode and direct flag.
+        let block_bytes = 2 * size_of::<u8>()
+            + 4 * size_of::<[i16; 2]>()
+            + 2 * size_of::<i8>()
+            + size_of::<i32>()
+            + size_of::<bool>();
+        // Per MB: chroma nC, deblock info, CBP, slice ID, chroma prediction
+        // mode and the four per-MB flags.
+        let mb_bytes = 16 * block_bytes
+            + 8 * size_of::<u8>()
+            + size_of::<MbInfo>()
+            + 2 * size_of::<u16>()
+            + size_of::<u8>()
+            + 4 * size_of::<bool>();
+        let coded_pixels = self.coded_luma.checked_add(2 * (self.coded_luma / 4))?;
+        let retained = dpb.picture_memory()?;
+        let resident = retained
+            .checked_add(output_bytes(pending_field)?)?
+            .checked_add(coded_pixels)?
+            .checked_add(self.total_mbs.checked_mul(mb_bytes)?)?
+            .checked_add(self.total_mbs.div_ceil(2).checked_mul(size_of::<bool>())?)?
+            .checked_add(header.mmco_ops.capacity().checked_mul(size_of::<(u32, u32)>())?)?;
+
+        // A boundary return and an intra availability map can be live
+        // during the new slice decode.
+        let decode_extra = output_bytes(boundary_output)?
+            .checked_add(self.total_mbs.checked_mul(size_of::<bool>())?)?;
+
+        // Finalization copies the coded planes before DPB insertion. Cropping
+        // replaces the working planes before any field weave, so reserve the
+        // larger output allocation.
+        let cropped = if self.width != self.mb_width * 16 || self.height != self.mb_height * 16 {
+            yuv420_bytes(self.width, self.height)?
+        } else {
+            0
+        };
+        let woven = if header.field_pic_flag && pending_field.is_some() {
+            yuv420_bytes(self.width, self.frame_height)?
+        } else {
+            0
+        };
+        let finalize_extra = coded_pixels.checked_add(cropped.max(woven))?;
+        resident.checked_add(decode_extra.max(finalize_extra))
+    }
+}
+
+fn yuv420_bytes(width: u32, height: u32) -> Option<usize> {
+    let width = width as usize;
+    let height = height as usize;
+    let chroma = (width / 2).checked_mul(height / 2)?;
+    width.checked_mul(height)?.checked_add(chroma.checked_mul(2)?)
+}
+
+fn output_bytes(output: Option<&DecodedOutput>) -> Option<usize> {
+    output.map_or(Some(0), |output| {
+        let Frame { y, u, v, .. } = &output.frame;
+        y.capacity().checked_add(u.capacity())?.checked_add(v.capacity())
+    })
+}
+
+struct StoredPps {
+    parsed: Arc<Pps>,
+    sps_revision: Arc<Sps>,
+    rbsp: Box<[u8]>,
+}
+
+struct DecodedOutput {
+    frame: Frame,
+    reorder_depth: Option<usize>,
+}
+
 /// In-progress picture state shared across slices within the same frame.
 #[derive(Clone)]
 struct PictureState {
     frame: Frame,
+    pps_id: u32,
+    sps_revision: Arc<Sps>,
+    pps_revision: Arc<Pps>,
+    previous_poc_state: (i32, u32),
     frame_num: u32,
     poc: i32,
     nal_unit_type: NalUnitType,
@@ -134,16 +276,14 @@ struct PictureState {
 /// }
 /// ```
 pub struct Decoder {
-    sps_table: HashMap<u32, Sps>,
-    pps_table: HashMap<u32, Pps>,
+    sps_table: HashMap<u32, Arc<Sps>>,
+    pps_table: HashMap<u32, StoredPps>,
     dpb: Dpb,
+    picture_memory_limit: usize,
     /// In-progress picture being assembled from one or more slices.
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
-    pending_field: Option<Frame>,
-    /// Display reorder depth the latest SPS promises: 0 for POC type 2 (output order is decode order), else
-    /// its VUI max_num_reorder_frames. `None` when the stream does not say.
-    reorder_depth: Option<usize>,
+    pending_field: Option<DecodedOutput>,
 }
 
 impl Default for Decoder {
@@ -154,14 +294,27 @@ impl Default for Decoder {
 
 impl Decoder {
     /// Create a new decoder with empty parameter set tables and DPB.
+    ///
+    /// Picture buffers and retained references share a 768 MiB budget.
     pub fn new() -> Self {
+        Self::with_picture_memory_limit(DEFAULT_PICTURE_MEMORY_LIMIT)
+    }
+
+    /// Create a decoder with a combined picture and reference budget in bytes.
+    ///
+    /// The budget includes picture working buffers, retained reference data
+    /// and space to finalize pictures and assemble fields. Bitstream parsing,
+    /// allocator overhead and frames already returned to the caller are separate.
+    /// Exceeding the budget returns a decode error and clears the pending
+    /// picture, staged field and reference buffer. Parameter sets remain loaded.
+    pub fn with_picture_memory_limit(limit_bytes: usize) -> Self {
         Self {
             sps_table: HashMap::new(),
             pps_table: HashMap::new(),
             dpb: Dpb::new(0),
+            picture_memory_limit: limit_bytes,
             pending: None,
             pending_field: None,
-            reorder_depth: None,
         }
     }
 
@@ -179,16 +332,23 @@ impl Decoder {
     /// Call [`flush`](Self::flush) after the last NAL to retrieve any
     /// remaining buffered frame.
     pub fn decode_nal(&mut self, nal: &NalUnit) -> Result<Option<Frame>, DecodeError> {
+        Ok(self.decode_nal_with_depth(nal)?.map(|output| output.frame))
+    }
+
+    fn decode_nal_with_depth(
+        &mut self,
+        nal: &NalUnit,
+    ) -> Result<Option<DecodedOutput>, DecodeError> {
         match nal.nal_unit_type {
             NalUnitType::Sps => {
                 let sps = parse_sps(&nal.rbsp)?;
-                self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
-                self.reorder_depth = if sps.pic_order_cnt_type == 2 {
-                    Some(0)
-                } else {
-                    sps.max_num_reorder_frames.map(|frames| frames as usize)
-                };
-                self.sps_table.insert(sps.seq_parameter_set_id, sps);
+                if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+                    return Err(DecodeError::Unsupported("only 8-bit H.264 is supported"));
+                }
+                let id = sps.seq_parameter_set_id;
+                if self.sps_table.get(&id).map(Arc::as_ref) != Some(&sps) {
+                    self.sps_table.insert(id, Arc::new(sps));
+                }
                 Ok(None)
             }
             NalUnitType::Pps => {
@@ -199,8 +359,21 @@ impl Decoder {
                     .sps_table
                     .get(&sps_id)
                     .ok_or(DecodeError::InvalidSyntax("PPS references an unknown SPS"))?;
-                let pps = parse_pps(&nal.rbsp, Some(sps))?;
-                self.pps_table.insert(pps.pic_parameter_set_id, pps);
+                let (pps, len) = parse_pps_with_len(&nal.rbsp, Some(sps))?;
+                let id = pps.pic_parameter_set_id;
+                let rbsp = &nal.rbsp[..len];
+                if !self.pps_table.get(&id).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.sps_revision, sps) && entry.rbsp.as_ref() == rbsp
+                }) {
+                    self.pps_table.insert(
+                        id,
+                        StoredPps {
+                            parsed: Arc::new(pps),
+                            sps_revision: Arc::clone(sps),
+                            rbsp: rbsp.into(),
+                        },
+                    );
+                }
                 Ok(None)
             }
             NalUnitType::Sei => Ok(None),
@@ -216,12 +389,12 @@ impl Decoder {
 
                 // Finalize pending frame if a new picture starts
                 let prev_frame = if is_new_picture {
-                    self.finalize_pending()
+                    self.finalize_pending(false)
                 } else {
                     None
                 };
 
-                if let Err(error) = self.decode_slice(nal) {
+                if let Err(error) = self.decode_slice(nal, prev_frame.as_ref()) {
                     // A partial picture must never escape through flush or
                     // become a reference for a subsequent decode.
                     self.pending = None;
@@ -241,7 +414,11 @@ impl Decoder {
     /// final frame, which is otherwise held internally awaiting a new picture
     /// to trigger its release.
     pub fn flush(&mut self) -> Option<Frame> {
-        let frame = self.finalize_pending();
+        self.flush_with_depth().map(|output| output.frame)
+    }
+
+    fn flush_with_depth(&mut self) -> Option<DecodedOutput> {
+        let frame = self.finalize_pending(true);
         if frame.is_some() {
             return frame;
         }
@@ -272,9 +449,27 @@ impl Decoder {
     }
 
     /// Finalize the pending picture: apply deblocking, insert into DPB, return frame.
-    fn finalize_pending(&mut self) -> Option<Frame> {
+    fn finalize_pending(&mut self, keep_unpaired_field: bool) -> Option<DecodedOutput> {
         let mut ps = self.pending.take()?;
+        if ps.mb_slice_id.contains(&UNDECODED_MB) {
+            // A slice can end successfully while the picture still has holes.
+            self.dpb.restore_poc_state(ps.previous_poc_state);
+            if !keep_unpaired_field {
+                self.pending_field = None;
+            }
+            return None;
+        }
 
+        let sps = &ps.sps_revision;
+        self.dpb.set_max_ref_frames(sps.max_num_ref_frames);
+        let reorder_depth = if sps.pic_order_cnt_type == 2 {
+            Some(0)
+        } else {
+            sps.max_num_reorder_frames.map(|frames| frames as usize)
+        };
+
+        // Filtering addresses the coded raster, including cropped columns.
+        let display_width = std::mem::replace(&mut ps.frame.width, ps.mb_width * 16);
         // Apply deblocking filter
         deblock::filter_frame_mbaff(
             &mut ps.frame,
@@ -286,6 +481,7 @@ impl Decoder {
             ps.chroma_qp_index_offset,
             ps.mbaff_frame_flag,
         );
+        ps.frame.width = display_width;
 
         if ps.nal_unit_type == NalUnitType::SliceIdr {
             self.dpb.clear();
@@ -343,7 +539,7 @@ impl Decoder {
             u: ps.frame.u.clone(),
             v: ps.frame.v.clone(),
             width: ps.mb_width * 16,
-            height: (ps.frame.height.div_ceil(16)) * 16,
+            height: ps.mb_height * 16,
             frame_num: ps.frame_num,
             pic_order_cnt: ps.poc,
             mv_l0: ps.mv_store_l0,
@@ -417,9 +613,14 @@ impl Decoder {
         }
 
         // For field pictures, combine two fields into one frame for output
+        let output = DecodedOutput {
+            frame: ps.frame,
+            reorder_depth,
+        };
         if ps.field_pic_flag {
-            let field_frame = ps.frame;
-            if let Some(first_field) = self.pending_field.take() {
+            let field_frame = &output.frame;
+            if let Some(first) = self.pending_field.take() {
+                let first_field = &first.frame;
                 // Second field arrived — combine into a full frame
                 let w = field_frame.width as usize;
                 let full_h = ps.frame_height as usize;
@@ -438,17 +639,17 @@ impl Decoder {
                         && f.u.len() >= ch * cw
                         && f.v.len() >= ch * cw
                 };
-                if w == 0 || full_h < 2 || !field_ok(&first_field) || !field_ok(&field_frame) {
+                if w == 0 || full_h < 2 || !field_ok(first_field) || !field_ok(field_frame) {
                     // Drop the stale field and hold the current one instead.
-                    self.pending_field = Some(field_frame);
+                    self.pending_field = Some(output);
                     return None;
                 }
 
                 // Determine which is top and which is bottom
                 let (top, bot) = if ps.bottom_field_flag {
-                    (&first_field, &field_frame)
+                    (first_field, field_frame)
                 } else {
-                    (&field_frame, &first_field)
+                    (field_frame, first_field)
                 };
 
                 // Interleave luma lines: top→even, bottom→odd
@@ -469,41 +670,75 @@ impl Decoder {
                         .copy_from_slice(&bot.v[src_off..src_off + cw]);
                 }
 
-                return Some(Frame {
-                    y,
-                    u,
-                    v,
-                    width: w as u32,
-                    height: full_h as u32,
-                    pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+                return Some(DecodedOutput {
+                    frame: Frame {
+                        y,
+                        u,
+                        v,
+                        width: w as u32,
+                        height: full_h as u32,
+                        pic_order_cnt: field_frame.pic_order_cnt.min(first_field.pic_order_cnt),
+                    },
+                    reorder_depth: first
+                        .reorder_depth
+                        .zip(reorder_depth)
+                        .map(|(a, b)| a.max(b)),
                 });
             } else {
                 // First field — hold it, return None
-                self.pending_field = Some(field_frame);
+                self.pending_field = Some(output);
                 return None;
             }
         }
 
-        Some(ps.frame)
+        Some(output)
     }
 
-    fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
+    fn decode_slice(
+        &mut self,
+        nal: &NalUnit,
+        boundary_output: Option<&DecodedOutput>,
+    ) -> Result<(), DecodeError> {
         let mut peek = BitstreamReader::new(&nal.rbsp);
-        let _first_mb = peek.read_ue()?;
+        let is_continuation = peek.read_ue()? > 0;
         let _slice_type = peek.read_ue()?;
         let pps_id = peek.read_ue()?;
-        let pps = self
+        let entry = self
             .pps_table
-            .get(&pps_id)
+            .get_mut(&pps_id)
             .ok_or(DecodeError::InvalidSyntax(
                 "slice references an unknown PPS",
             ))?;
         let sps = self
             .sps_table
-            .get(&pps.seq_parameter_set_id)
+            .get(&entry.parsed.seq_parameter_set_id)
             .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
 
-        let (header, reader) =
+        // Reject a changed parameter set before it can affect the slice header or POC.
+        if is_continuation {
+            let picture = self
+                .pending
+                .as_mut()
+                .filter(|picture| {
+                    picture.pps_id == pps_id
+                        && Arc::ptr_eq(&picture.sps_revision, sps)
+                        && Arc::ptr_eq(&picture.pps_revision, &entry.parsed)
+                })
+                .ok_or(DecodeError::InvalidSyntax(
+                    "inconsistent continuation parameter sets",
+                ))?;
+            // The next slice replaces this marking data, or clears the picture
+            // on error. Release the old vector before parsing its replacement.
+            picture.mmco_ops = Vec::new();
+        }
+        if !Arc::ptr_eq(&entry.sps_revision, sps) {
+            // Effective scaling lists include defaults inherited from the active SPS.
+            entry.parsed = Arc::new(parse_pps(&entry.rbsp, Some(sps))?);
+            entry.sps_revision = Arc::clone(sps);
+        }
+        let pps = &entry.parsed;
+
+        let (mut header, reader) =
             parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
 
         if header.slice_type != SliceType::I
@@ -515,30 +750,25 @@ impl Decoder {
         let is_field_pic = header.field_pic_flag;
 
         // Compute POC for current picture (needed for B-slice ref list construction)
+        let previous_poc_state = self.dpb.poc_state();
+        if let Some(picture) = self.pending.as_ref().filter(|_| is_continuation) {
+            // Every slice derives this picture's POC from the same prior picture.
+            self.dpb.restore_poc_state(picture.previous_poc_state);
+        }
         let current_poc = self
             .dpb
             .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
 
-        let lists = slice_setup::reference_lists(&self.dpb, sps, &header, current_poc)?;
-
-        let width = sps.width();
-        let frame_height = sps.height();
-        // Reject absurd dimensions that would cause allocation overflow.
-        // H.264 Level 6.2 max is 8192x4320; allow up to 16384x16384 for headroom.
-        if width == 0 || frame_height == 0 || width > 16384 || frame_height > 16384 {
-            return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
-        }
-        // For field pictures, each field has half the frame height
-        let height = if is_field_pic {
-            frame_height / 2
-        } else {
-            frame_height
-        };
-        let mb_width = width.div_ceil(16);
-        let mb_height = height.div_ceil(16);
-        let coded_width = mb_width * 16;
-        let coded_height = mb_height * 16;
-        let total_mbs = (mb_width * mb_height) as usize;
+        let layout = PictureLayout::new(sps, is_field_pic)?;
+        let PictureLayout {
+            width,
+            height,
+            frame_height,
+            mb_width,
+            mb_height,
+            total_mbs,
+            coded_luma,
+        } = layout;
 
         let slice_qp = header.qp_y(pps);
 
@@ -546,7 +776,6 @@ impl Decoder {
         // For continuation slices (first_mb > 0), reuse the pending state
         // so per-MB data from earlier slices is visible for MV prediction,
         // CABAC neighbor contexts, and deblocking.
-        let is_continuation = header.first_mb_in_slice > 0;
         if is_continuation
             && !self.pending.as_ref().is_some_and(|picture| {
                 picture.mb_slice_id.len() == total_mbs
@@ -554,13 +783,29 @@ impl Decoder {
                     && picture.frame.height == height
                     && picture.frame_num == header.frame_num
                     && picture.poc == current_poc
+                    && picture.mbaff_frame_flag == header.mbaff_frame_flag
+                    && picture.field_pic_flag == header.field_pic_flag
+                    && picture.bottom_field_flag == header.bottom_field_flag
+                    && picture.nal_unit_type == nal.nal_unit_type
+                    && picture.nal_ref_idc == nal.nal_ref_idc
             })
         {
             return Err(DecodeError::InvalidSyntax(
                 "inconsistent continuation slice",
             ));
         }
-        let ps = if is_continuation {
+        let peak = layout.peak_bytes(
+            &header,
+            &self.dpb,
+            self.pending_field.as_ref(),
+            boundary_output,
+        );
+        if !peak.is_some_and(|bytes| bytes <= self.picture_memory_limit) {
+            return Err(PICTURE_MEMORY_ERROR);
+        }
+
+        let lists = slice_setup::reference_lists(&self.dpb, sps, &header, current_poc)?;
+        let mut ps = if is_continuation {
             self.pending
                 .take()
                 .ok_or(DecodeError::InvalidSyntax("missing continuation picture"))?
@@ -569,11 +814,15 @@ impl Decoder {
                 frame: Frame {
                     width,
                     height,
-                    y: vec![0u8; (coded_width * coded_height) as usize],
-                    u: vec![0u8; (coded_width * coded_height / 4) as usize],
-                    v: vec![0u8; (coded_width * coded_height / 4) as usize],
+                    y: vec![0u8; coded_luma],
+                    u: vec![0u8; coded_luma / 4],
+                    v: vec![0u8; coded_luma / 4],
                     pic_order_cnt: current_poc,
                 },
+                pps_id,
+                sps_revision: Arc::clone(sps),
+                pps_revision: Arc::clone(pps),
+                previous_poc_state,
                 frame_num: header.frame_num,
                 poc: current_poc,
                 nal_unit_type: nal.nal_unit_type,
@@ -597,11 +846,11 @@ impl Decoder {
                 mb_is_direct: vec![false; total_mbs],
                 blk_is_direct: vec![false; total_mbs * 16],
                 is_i16x16: vec![false; total_mbs],
-                mb_slice_id: vec![0u16; total_mbs],
+                mb_slice_id: vec![UNDECODED_MB; total_mbs],
                 current_slice_id: 0,
                 prev_mb_qp: slice_qp,
                 last_qp_delta_nonzero: false,
-                mmco_ops: header.mmco_ops.clone(),
+                mmco_ops: Vec::new(),
                 long_term_reference_flag: header.long_term_reference_flag,
                 is_intra_slice: header.slice_type == SliceType::I,
                 disable_deblocking_filter_idc: header.disable_deblocking_filter_idc,
@@ -618,6 +867,8 @@ impl Decoder {
             }
         };
 
+        // Keep only the admitted marking vector, including on continuations.
+        ps.mmco_ops = std::mem::take(&mut header.mmco_ops);
         self.pending = Some(Self::decode_macroblocks(
             nal,
             sps,
@@ -667,6 +918,10 @@ impl Decoder {
 
         let PictureState {
             mut frame,
+            pps_id,
+            sps_revision,
+            pps_revision,
+            previous_poc_state,
             frame_num: _ps_frame_num,
             poc: _ps_poc,
             nal_unit_type: _ps_nal_type,
@@ -694,7 +949,7 @@ impl Decoder {
             mut current_slice_id,
             prev_mb_qp: _,
             last_qp_delta_nonzero: _,
-            mmco_ops: _ps_mmco_ops,
+            mmco_ops,
             long_term_reference_flag: _ps_lt_ref_flag,
             is_intra_slice: _ps_is_intra,
             disable_deblocking_filter_idc: ps_deblock_idc,
@@ -714,6 +969,7 @@ impl Decoder {
         if is_continuation {
             current_slice_id = current_slice_id
                 .checked_add(1)
+                .filter(|id| *id != UNDECODED_MB)
                 .ok_or(DecodeError::InvalidSyntax("too many slices in a picture"))?;
         }
         let this_slice_id = current_slice_id;
@@ -824,14 +1080,13 @@ impl Decoder {
         };
 
         // In MBAFF, first_mb_in_slice is a pair address
-        let mut mb_idx = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
-        if mb_idx >= total_mbs {
+        let addr_scale = if mbaff { 2 } else { 1 };
+        let first_mb_addr = header.first_mb_in_slice as usize;
+        if first_mb_addr >= total_mbs / addr_scale {
             return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
         }
+        let first_mb = first_mb_addr * addr_scale;
+        let mut mb_idx = first_mb;
         while mb_idx < total_mbs {
             // CAVLC end-of-slice: check before reading any new syntax elements.
             // Skip this check when counting down a skip run (no reads needed).
@@ -840,7 +1095,7 @@ impl Decoder {
             }
 
             // Stamp this MB with the current slice ID for boundary detection
-            mb_slice_id[mb_idx] = this_slice_id;
+            let previous_slice_id = std::mem::replace(&mut mb_slice_id[mb_idx], this_slice_id);
             // Compute pixel position
             let (mb_x, mb_y) = if mbaff {
                 let pair_addr = mb_idx / 2;
@@ -869,7 +1124,10 @@ impl Decoder {
                 {
                     let mut ctx = make_ctx!();
                     match ctx.decode_cabac_mb(cr, st, &nal.rbsp, mb_idx, mb_x, mb_y, &params)? {
-                        CabacMbResult::EndOfSlice => break,
+                        CabacMbResult::EndOfSlice => {
+                            ctx.mb_slice_id[mb_idx] = previous_slice_id;
+                            break;
+                        }
                         CabacMbResult::Decoded => {}
                     }
                     prev_mb_qp = ctx.prev_mb_qp;
@@ -890,7 +1148,11 @@ impl Decoder {
             // P/B-slice skip run handling
             if is_p_slice || is_b_slice {
                 if mb_skip_run < 0 {
-                    mb_skip_run = reader.read_ue()? as i32;
+                    let run = reader.read_ue()? as usize;
+                    if run > total_mbs - mb_idx {
+                        return Err(DecodeError::InvalidSyntax("mb_skip_run out of range"));
+                    }
+                    mb_skip_run = run as i32;
                 }
                 if mb_skip_run > 0 {
                     mb_skip_run -= 1;
@@ -959,17 +1221,16 @@ impl Decoder {
         }
 
         // Post-loop: fill deblock info and ref POC table
-        let first_mb = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
         make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
 
         // The caller commits a picture only after the complete slice succeeds.
         // Deblocking and DPB insertion happen in finalize_pending().
         Ok(PictureState {
             frame,
+            pps_id,
+            sps_revision,
+            pps_revision,
+            previous_poc_state,
             frame_num: header.frame_num,
             poc: current_poc,
             nal_unit_type: nal.nal_unit_type,
@@ -997,7 +1258,7 @@ impl Decoder {
             current_slice_id,
             prev_mb_qp,
             last_qp_delta_nonzero,
-            mmco_ops: header.mmco_ops.clone(),
+            mmco_ops,
             long_term_reference_flag: header.long_term_reference_flag,
             is_intra_slice: header.slice_type == SliceType::I,
             disable_deblocking_filter_idc: ps_deblock_idc,
@@ -1032,7 +1293,9 @@ impl Decoder {
 /// decoded frames. Frames are emitted in `(gop_id, pic_order_cnt)` order.
 /// On each IDR boundary, all buffered frames from the previous GOP are
 /// drained and returned. The buffer also has a maximum depth (16 frames)
-/// to bound latency for streams with infrequent IDRs.
+/// to bound latency for streams with infrequent IDRs. Queued display frames
+/// have this separate depth limit and are outside the inner decoder's picture
+/// and reference budget.
 ///
 /// # Example
 ///
@@ -1078,20 +1341,22 @@ impl OrderedDecoder {
     /// Create a new ordering decoder with a default reorder buffer depth of
     /// 16 frames (sufficient for any practical bframes setting).
     pub fn new() -> Self {
-        Self {
-            inner: Decoder::new(),
-            buffer: Vec::new(),
-            gop_id: 0,
-            max_depth: 16,
-        }
+        Self::with_max_depth(16)
     }
 
     /// Create a new ordering decoder with a custom maximum buffer depth.
     /// Larger values give more reordering headroom for unusual bitstreams
-    /// but increase end-to-end latency.
+    /// but increase end-to-end latency. The picture budget defaults to 768 MiB.
     pub fn with_max_depth(max_depth: usize) -> Self {
+        Self::with_limits(max_depth, DEFAULT_PICTURE_MEMORY_LIMIT)
+    }
+
+    /// Create an ordering decoder with a custom reorder depth and picture
+    /// memory budget in bytes. See [`Decoder::with_picture_memory_limit`]
+    /// for the scope of the budget and error behavior.
+    pub fn with_limits(max_depth: usize, picture_memory_limit_bytes: usize) -> Self {
         Self {
-            inner: Decoder::new(),
+            inner: Decoder::with_picture_memory_limit(picture_memory_limit_bytes),
             buffer: Vec::new(),
             gop_id: 0,
             max_depth: max_depth.max(1),
@@ -1116,9 +1381,13 @@ impl OrderedDecoder {
         // Decode the NAL. Note that decode_nal returns the PREVIOUS frame
         // (the picture that just got finalized when this NAL started a new
         // one), so the returned frame still belongs to the current gop_id.
-        if let Some(frame) = self.inner.decode_nal(nal)? {
-            self.buffer.push((self.gop_id, frame));
-        }
+        let depth = self.inner.decode_nal_with_depth(nal)?.map(|decoded| {
+            self.buffer.push((self.gop_id, decoded.frame));
+            decoded
+                .reorder_depth
+                .unwrap_or(self.max_depth)
+                .min(self.max_depth)
+        });
 
         // After pushing, advance the GOP if this NAL was an IDR start.
         // This must happen AFTER the push so the previous GOP's last frame
@@ -1133,13 +1402,12 @@ impl OrderedDecoder {
             self.drain_completed_gops(&mut output);
         }
 
-        // Bound buffer depth to limit reorder latency; a stream that declares its reorder depth needs no more.
-        let depth = self
-            .inner
-            .reorder_depth
-            .map_or(self.max_depth, |depth| depth.min(self.max_depth));
-        while self.buffer.len() > depth {
-            output.push(self.pop_lowest()?);
+        // The bound comes from the picture returned above, not the slice that
+        // triggered its finalization. Parameter-set NALs do not release frames.
+        if let Some(depth) = depth {
+            while self.buffer.len() > depth {
+                output.push(self.pop_lowest()?);
+            }
         }
 
         Ok(output)
@@ -1149,8 +1417,8 @@ impl OrderedDecoder {
     /// Call this once after the last `decode_nal`.
     pub fn flush(&mut self) -> Vec<Frame> {
         // First, get any final pending frame from the inner decoder.
-        if let Some(frame) = self.inner.flush() {
-            self.buffer.push((self.gop_id, frame));
+        if let Some(decoded) = self.inner.flush_with_depth() {
+            self.buffer.push((self.gop_id, decoded.frame));
         }
         // Drain everything in (gop, poc) order.
         self.buffer.sort_by_key(|(g, f)| (*g, f.pic_order_cnt));
@@ -1209,6 +1477,429 @@ impl OrderedDecoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    // Generate small CAVLC I_PCM pictures so admission is tested through
+    // decode_nal with real, independently predictable output samples.
+    #[derive(Clone, Copy)]
+    enum BudgetScan {
+        Frame,
+        Field { bottom: bool },
+        Mbaff,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BudgetReference {
+        Idr { long_term: bool },
+        Short,
+        Long(u32),
+        Unused,
+    }
+
+    #[derive(Default)]
+    struct BudgetRbsp(Vec<bool>);
+
+    impl BudgetRbsp {
+        fn bits(&mut self, value: u32, width: u32) {
+            self.0
+                .extend((0..width).rev().map(|bit| ((value >> bit) & 1) != 0));
+        }
+
+        fn ue(&mut self, value: u32) {
+            let code = value + 1;
+            let width = u32::BITS - code.leading_zeros();
+            self.bits(0, width - 1);
+            self.bits(code, width);
+        }
+
+        fn align(&mut self) {
+            self.0.resize(self.0.len().div_ceil(8) * 8, false);
+        }
+
+        fn nal(mut self, nal_unit_type: NalUnitType, nal_ref_idc: u8) -> NalUnit<'static> {
+            self.bits(1, 1);
+            self.align();
+            let rbsp = self
+                .0
+                .chunks_exact(8)
+                .map(|byte| byte.iter().fold(0u8, |acc, &bit| (acc << 1) | u8::from(bit)))
+                .collect();
+            NalUnit {
+                nal_unit_type,
+                nal_ref_idc,
+                rbsp: std::borrow::Cow::Owned(rbsp),
+            }
+        }
+    }
+
+    fn budget_sps(width_mbs: u32, crop_right: u32, refs: u32, scan: BudgetScan) -> NalUnit<'static> {
+        let mut bits = BudgetRbsp::default();
+        bits.bits(77, 8); // Main profile, 8-bit 4:2:0
+        bits.bits(0, 8);
+        bits.bits(30, 8); // Level 3.0
+        bits.ue(0); // SPS ID
+        bits.ue(0); // 4-bit frame_num
+        bits.ue(2); // POC type
+        bits.ue(refs);
+        bits.bits(0, 1); // gaps_in_frame_num_value_allowed_flag
+        bits.ue(width_mbs - 1);
+        bits.ue(0); // one map unit high
+        let frame_only = matches!(scan, BudgetScan::Frame);
+        bits.bits(frame_only as u32, 1);
+        if !frame_only {
+            bits.bits(matches!(scan, BudgetScan::Mbaff) as u32, 1);
+        }
+        bits.bits(1, 1); // direct_8x8_inference_flag
+        bits.bits((crop_right != 0) as u32, 1);
+        if crop_right != 0 {
+            for offset in [0, crop_right, 0, 0] {
+                bits.ue(offset);
+            }
+        }
+        bits.bits(0, 1); // no VUI
+        bits.nal(NalUnitType::Sps, 3)
+    }
+
+    fn budget_pps() -> NalUnit<'static> {
+        // PPS 0/SPS 0, CAVLC, one slice group, deblocking control present.
+        NalUnit {
+            nal_unit_type: NalUnitType::Pps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0xce, 0x3c, 0x80]),
+        }
+    }
+
+    fn budget_pcm(
+        scan: BudgetScan,
+        frame_num: u32,
+        reference: BudgetReference,
+        first_mb: u32,
+        samples: &[u8],
+    ) -> NalUnit<'static> {
+        let mut bits = BudgetRbsp::default();
+        bits.ue(first_mb);
+        bits.ue(2); // I slice
+        bits.ue(0); // PPS ID
+        bits.bits(frame_num, 4);
+        match scan {
+            BudgetScan::Frame => {}
+            BudgetScan::Field { bottom } => {
+                bits.bits(1, 1);
+                bits.bits(bottom as u32, 1);
+            }
+            BudgetScan::Mbaff => bits.bits(0, 1), // frame picture in a field-capable SPS
+        }
+        let (kind, ref_idc) = match reference {
+            BudgetReference::Idr { long_term } => {
+                bits.ue(0); // idr_pic_id
+                bits.bits(0, 1); // no_output_of_prior_pics_flag
+                bits.bits(long_term as u32, 1);
+                (NalUnitType::SliceIdr, 3)
+            }
+            BudgetReference::Short => {
+                bits.bits(0, 1); // sliding-window marking
+                (NalUnitType::Slice, 3)
+            }
+            BudgetReference::Long(index) => {
+                bits.bits(1, 1); // adaptive marking
+                bits.ue(4);
+                bits.ue(index + 1);
+                bits.ue(6);
+                bits.ue(index);
+                bits.ue(0);
+                (NalUnitType::Slice, 3)
+            }
+            BudgetReference::Unused => (NalUnitType::Slice, 0),
+        };
+        bits.ue(0); // slice_qp_delta
+        bits.ue(1); // disable deblocking
+        for (mb, &sample) in samples.iter().enumerate() {
+            if matches!(scan, BudgetScan::Mbaff) && mb % 2 == 0 {
+                bits.bits(0, 1); // frame-coded MB pair
+            }
+            bits.ue(25); // I_PCM
+            bits.align();
+            for _ in 0..384 {
+                bits.bits(u32::from(sample), 8);
+            }
+        }
+        bits.nal(kind, ref_idc)
+    }
+
+    const BUDGET_IDR: BudgetReference = BudgetReference::Idr { long_term: false };
+    const MB_PLANES: usize = 384;
+    // One coded MB retained as YUV plus 16 L0/L1 MVs, L0/L1 indices and L0 POCs.
+    const REF_MB: usize = MB_PLANES + 224;
+
+    fn budget_working_bytes(mbs: usize) -> usize {
+        // Hand-counted current-picture payload on this target, excluding copies.
+        mbs * (801 + size_of::<MbInfo>()) + mbs.div_ceil(2)
+    }
+
+    fn budget_decoder(limit: usize, sps: &NalUnit) -> Decoder {
+        let mut decoder = Decoder::with_picture_memory_limit(limit);
+        assert!(decoder.decode_nal(sps).unwrap().is_none());
+        assert!(decoder.decode_nal(&budget_pps()).unwrap().is_none());
+        decoder
+    }
+
+    fn assert_budget_error<T>(result: Result<T, DecodeError>) {
+        assert!(matches!(
+            result,
+            Err(DecodeError::Unsupported("picture memory budget exceeded"))
+        ));
+    }
+
+    fn assert_budget_rows(
+        frame: Frame,
+        width: u32,
+        height: u32,
+        rows: impl Fn(usize, usize) -> u8,
+    ) {
+        assert_eq!((frame.width, frame.height), (width, height));
+        for (name, plane, w, h) in [
+            ("Y", frame.y, width, height),
+            ("U", frame.u, width / 2, height / 2),
+            ("V", frame.v, width / 2, height / 2),
+        ] {
+            assert_eq!(plane.len(), (w * h) as usize);
+            for (row, samples) in plane.chunks_exact(w as usize).enumerate() {
+                let expected = rows(row, h as usize);
+                assert!(
+                    samples.iter().all(|&sample| sample == expected),
+                    "{name} row {row}: expected {expected}, got {samples:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_picture_budget_exact_boundary_flush_and_recovery() {
+        let scan = BudgetScan::Frame;
+        let sps = budget_sps(1, 0, 2, scan);
+        let idr = budget_pcm(scan, 0, BUDGET_IDR, 0, &[81]);
+        let next = budget_pcm(scan, 1, BudgetReference::Unused, 0, &[163]);
+        let first_limit = budget_working_bytes(1) + MB_PLANES;
+        let mut decoder = budget_decoder(first_limit - 1, &sps);
+        assert_budget_error(decoder.decode_nal(&idr));
+        assert!(decoder.flush().is_none());
+
+        let mut decoder = budget_decoder(first_limit, &sps);
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        assert_budget_rows(decoder.flush().unwrap(), 16, 16, |_, _| 81);
+        assert!(decoder.flush().is_none());
+
+        // The second slice sees a live reference and the first frame being
+        // returned from this call, plus one byte of intra availability scratch.
+        let boundary_limit = budget_working_bytes(1) + REF_MB + MB_PLANES + 1;
+        let mut decoder = budget_decoder(boundary_limit - 1, &sps);
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        assert_budget_error(decoder.decode_nal(&next));
+        assert!(decoder.flush().is_none());
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        assert_budget_rows(decoder.flush().unwrap(), 16, 16, |_, _| 81);
+
+        let mut decoder = budget_decoder(boundary_limit, &sps);
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        let first = decoder.decode_nal(&next).unwrap().unwrap();
+        assert_eq!(first.pic_order_cnt, 0);
+        assert_budget_rows(first, 16, 16, |_, _| 81);
+        let second = decoder.flush().unwrap();
+        assert_eq!(second.pic_order_cnt, 1);
+        assert_budget_rows(second, 16, 16, |_, _| 163);
+    }
+
+    #[test]
+    fn test_picture_budget_inter_boundary_uses_retained_bytes() {
+        let scan = BudgetScan::Frame;
+        let sps = budget_sps(1, 0, 2, scan);
+        let idr = budget_pcm(scan, 0, BUDGET_IDR, 0, &[81]);
+        let mut bits = BudgetRbsp::default();
+        bits.ue(0); // first_mb_in_slice
+        bits.ue(0); // P slice
+        bits.ue(0); // PPS ID
+        bits.bits(1, 4); // frame_num
+        bits.bits(0, 1); // default active reference count
+        bits.bits(0, 1); // no reference list modification
+        bits.ue(0); // slice_qp_delta
+        bits.ue(1); // disable deblocking
+        bits.ue(1); // one skipped macroblock
+        let inter = bits.nal(NalUnitType::Slice, 0);
+
+        // The previous output and reference are both live, with room for
+        // the availability map. Motion compensation borrows the reference.
+        let limit = budget_working_bytes(1) + REF_MB + MB_PLANES + 1;
+        let mut decoder = budget_decoder(limit - 1, &sps);
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        assert_budget_error(decoder.decode_nal(&inter));
+        assert!(decoder.flush().is_none());
+
+        let mut decoder = budget_decoder(limit, &sps);
+        assert!(decoder.decode_nal(&idr).unwrap().is_none());
+        assert_budget_rows(decoder.decode_nal(&inter).unwrap().unwrap(), 16, 16, |_, _| 81);
+        assert_budget_rows(decoder.flush().unwrap(), 16, 16, |_, _| 81);
+    }
+
+    #[test]
+    fn test_picture_budget_crop_mixed_sizes_and_continuation() {
+        let scan = BudgetScan::Frame;
+        let small_sps = budget_sps(1, 0, 4, scan);
+        let cropped_sps = budget_sps(2, 8, 4, scan); // 32x16 coded, 16x16 displayed
+        let first = budget_pcm(scan, 0, BUDGET_IDR, 0, &[61]);
+        // Deliberately reuse frame_num 0 across an SPS change: both DPB entries
+        // have independent allocations and must be charged at their coded sizes.
+        let second = budget_pcm(scan, 0, BudgetReference::Short, 0, &[102, 131]);
+        let third = budget_pcm(scan, 1, BudgetReference::Short, 0, &[183]);
+        let third_tail = budget_pcm(scan, 1, BudgetReference::Short, 1, &[199]);
+        let crop_peak = budget_working_bytes(2) + 3 * MB_PLANES;
+
+        // Cropping an out-of-range coded axis down to 16 pixels cannot
+        // bypass the coded-axis limit, even before the memory check.
+        let overwide_sps = budget_sps(1025, 8192, 4, scan);
+        let mut decoder = budget_decoder(crop_peak, &overwide_sps);
+        assert!(matches!(
+            decoder.decode_nal(&second),
+            Err(DecodeError::InvalidSyntax("SPS coded dimensions out of range"))
+        ));
+
+        let mut decoder = budget_decoder(crop_peak - 1, &cropped_sps);
+        assert_budget_error(decoder.decode_nal(&second));
+        assert!(decoder.flush().is_none());
+
+        let mixed_peak = crop_peak + 3 * REF_MB;
+        for limit in [mixed_peak - 1, mixed_peak] {
+            let mut decoder = budget_decoder(limit, &small_sps);
+            assert!(decoder.decode_nal(&first).unwrap().is_none());
+            assert!(decoder.decode_nal(&cropped_sps).unwrap().is_none());
+            assert_budget_rows(decoder.decode_nal(&second).unwrap().unwrap(), 16, 16, |_, _| 61);
+
+            let boundary = decoder.decode_nal(&third);
+            if limit < mixed_peak {
+                assert_budget_error(boundary);
+                assert!(decoder.flush().is_none());
+            } else {
+                assert_budget_rows(boundary.unwrap().unwrap(), 16, 16, |_, _| 102);
+                assert!(decoder.decode_nal(&third_tail).unwrap().is_none());
+                assert_budget_rows(decoder.flush().unwrap(), 16, 16, |_, _| 183);
+            }
+        }
+    }
+
+    #[test]
+    fn test_picture_budget_continuation_cannot_grow_marking_past_limit() {
+        let scan = BudgetScan::Frame;
+        let sps = budget_sps(2, 0, 4, scan);
+        let first = budget_pcm(scan, 1, BudgetReference::Short, 0, &[68]);
+        let oversized_tail = budget_pcm(scan, 1, BudgetReference::Long(1), 1, &[68]);
+        let tail = budget_pcm(scan, 1, BudgetReference::Short, 1, &[68]);
+        let limit = budget_working_bytes(2) + 2 * MB_PLANES;
+        let mut decoder = budget_decoder(limit, &sps);
+
+        assert!(decoder.decode_nal(&first).unwrap().is_none());
+        assert_budget_error(decoder.decode_nal(&oversized_tail));
+        assert!(decoder.flush().is_none());
+
+        assert!(decoder.decode_nal(&first).unwrap().is_none());
+        assert!(decoder.decode_nal(&tail).unwrap().is_none());
+        assert_budget_rows(decoder.flush().unwrap(), 32, 16, |_, _| 68);
+    }
+
+    #[test]
+    fn test_picture_budget_field_pair_weave_and_mbaff() {
+        let top = BudgetScan::Field { bottom: false };
+        let bottom = BudgetScan::Field { bottom: true };
+        let fields = budget_sps(1, 0, 1, top);
+        let first = budget_pcm(top, 0, BUDGET_IDR, 0, &[83]);
+        let second = budget_pcm(bottom, 0, BudgetReference::Short, 0, &[143]);
+        let pair_peak = budget_working_bytes(1) + REF_MB + 4 * MB_PLANES;
+
+        let mut decoder = budget_decoder(pair_peak - 1, &fields);
+        assert!(decoder.decode_nal(&first).unwrap().is_none());
+        assert_budget_error(decoder.decode_nal(&second));
+        assert!(decoder.flush().is_none());
+
+        let mut decoder = budget_decoder(pair_peak, &fields);
+        assert!(decoder.decode_nal(&first).unwrap().is_none());
+        assert!(decoder.decode_nal(&second).unwrap().is_none());
+        assert_budget_rows(decoder.flush().unwrap(), 16, 32, |row, _| {
+            if row % 2 == 0 { 83 } else { 143 }
+        });
+
+        let mbaff = BudgetScan::Mbaff;
+        let mbaff_sps = budget_sps(1, 0, 1, mbaff);
+        let third = budget_pcm(mbaff, 1, BudgetReference::Unused, 0, &[110, 171]);
+        // Finalizing the second field at this boundary leaves both reference
+        // fields with the same frame_num and a woven 16x32 output live.
+        let mbaff_peak = budget_working_bytes(2) + 2 * REF_MB + 2 * MB_PLANES + 2;
+        for limit in [mbaff_peak - 1, mbaff_peak] {
+            let mut decoder = budget_decoder(limit, &fields);
+            assert!(decoder.decode_nal(&first).unwrap().is_none());
+            assert!(decoder.decode_nal(&second).unwrap().is_none());
+            assert!(decoder.decode_nal(&mbaff_sps).unwrap().is_none());
+            let boundary = decoder.decode_nal(&third);
+            if limit < mbaff_peak {
+                assert_budget_error(boundary);
+                assert!(decoder.flush().is_none());
+            } else {
+                assert_budget_rows(boundary.unwrap().unwrap(), 16, 32, |row, _| {
+                    if row % 2 == 0 { 83 } else { 143 }
+                });
+                assert_budget_rows(decoder.flush().unwrap(), 16, 32, |row, plane_height| {
+                    if row < plane_height / 2 { 110 } else { 171 }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn test_picture_budget_zero_ref_count_and_all_long_term() {
+        let scan = BudgetScan::Frame;
+        let cases = [
+            (0, BUDGET_IDR, BudgetReference::Short),
+            (
+                1,
+                BudgetReference::Idr { long_term: true },
+                BudgetReference::Long(1),
+            ),
+        ];
+        let limit = budget_working_bytes(1) + MB_PLANES + REF_MB + 128;
+        for (refs, first_mark, second_mark) in cases {
+            let sps = budget_sps(1, 0, refs, scan);
+            let first = budget_pcm(scan, 0, first_mark, 0, &[87]);
+            let second = budget_pcm(scan, 1, second_mark, 0, &[146]);
+            let third = budget_pcm(scan, 2, BudgetReference::Short, 0, &[191]);
+
+            let mut decoder = budget_decoder(limit, &sps);
+            assert!(decoder.decode_nal(&first).unwrap().is_none());
+            assert_budget_rows(decoder.decode_nal(&second).unwrap().unwrap(), 16, 16, |_, _| 87);
+            assert_budget_rows(decoder.flush().unwrap(), 16, 16, |_, _| 146);
+            if matches!(second_mark, BudgetReference::Long(_)) {
+                let long_term = decoder.dpb.long_term_ref_list();
+                let frame_nums: Vec<_> = long_term.iter().map(|pic| pic.frame_num).collect();
+                assert_eq!(frame_nums, [0, 1]);
+            }
+            assert_budget_error(decoder.decode_nal(&third));
+            assert!(decoder.flush().is_none());
+        }
+    }
+
+    #[test]
+    fn test_picture_budget_ordered_entry_and_recovery() {
+        let scan = BudgetScan::Frame;
+        let sps = budget_sps(1, 0, 2, scan);
+        let idr = budget_pcm(scan, 0, BUDGET_IDR, 0, &[75]);
+        let next = budget_pcm(scan, 1, BudgetReference::Unused, 0, &[155]);
+        let limit = budget_working_bytes(1) + MB_PLANES + REF_MB;
+        let mut decoder = OrderedDecoder::with_limits(16, limit);
+        assert!(decoder.decode_nal(&sps).unwrap().is_empty());
+        assert!(decoder.decode_nal(&budget_pps()).unwrap().is_empty());
+        assert!(decoder.decode_nal(&idr).unwrap().is_empty());
+        assert_budget_error(decoder.decode_nal(&next));
+        assert!(decoder.flush().is_empty());
+        assert!(decoder.decode_nal(&idr).unwrap().is_empty());
+        let mut frames = decoder.flush();
+        assert_eq!(frames.len(), 1);
+        assert_budget_rows(frames.pop().unwrap(), 16, 16, |_, _| 75);
+    }
 
     #[test]
     fn test_decode_single_idr_frame() {
@@ -1828,6 +2519,295 @@ mod tests {
         // Tests multi-slice P-frame decode with cross-slice intra prediction
         // and nC boundary handling across both I and P slices.
         decode_multiframe_and_compare("ms_cavlc_p_test", 5, 64, 64);
+    }
+
+    #[test]
+    fn test_multislice_parameter_set_revision() {
+        let stream = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/ms_cavlc_p_test.h264"
+        ))
+        .unwrap();
+        let expected = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/ms_cavlc_p_test.yuv"
+        ))
+        .unwrap();
+        let nals = parse_annex_b(&stream);
+        let sps = nals
+            .iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Sps)
+            .unwrap();
+        let pps = nals
+            .iter()
+            .find(|nal| nal.nal_unit_type == NalUnitType::Pps)
+            .unwrap();
+        let slices: Vec<_> = nals
+            .iter()
+            .filter(|nal| {
+                matches!(
+                    nal.nal_unit_type,
+                    NalUnitType::SliceIdr | NalUnitType::Slice
+                )
+            })
+            .collect();
+        let idr = &slices[..4];
+
+        // The fixture uses SPS 0 with POC type 2 and one reference frame.
+        // Replace it with a slice-compatible SPS 0 that permits two references.
+        let replacement_sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x0a, 0xdb, 0x10, 0x99]),
+        };
+        // PPS 0 with constrained intra prediction enabled. The IDR is all intra.
+        let replacement_pps = NalUnit {
+            nal_unit_type: NalUnitType::Pps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0xcf, 0x32, 0xe8]),
+        };
+        // SPS 1 also permits two references, but uses POC type 0 with no VUI.
+        let unrelated_sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x0a, 0x5d, 0x88, 0x4c, 0x80]),
+        };
+        // PPS 1 references SPS 1.
+        let unrelated_pps = NalUnit {
+            nal_unit_type: NalUnitType::Pps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x48, 0xf3, 0x2c, 0x80]),
+        };
+
+        let setup = || {
+            let mut decoder = Decoder::new();
+            for nal in [sps, pps] {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            decoder
+        };
+        let assert_frame = |frame: Frame, index: usize| {
+            let size = 64 * 64 * 3 / 2;
+            let yuv = [frame.y, frame.u, frame.v].concat();
+            assert_eq!(yuv.as_slice(), &expected[index * size..(index + 1) * size]);
+        };
+
+        for replacement in [&replacement_sps, &replacement_pps] {
+            let mut decoder = setup();
+            assert!(decoder.decode_nal(idr[0]).unwrap().is_none());
+            assert!(decoder.decode_nal(replacement).unwrap().is_none());
+            assert!(matches!(
+                decoder.decode_nal(idr[1]),
+                Err(DecodeError::InvalidSyntax(
+                    "inconsistent continuation parameter sets"
+                ))
+            ));
+            assert!(decoder.flush().is_none());
+
+            for nal in idr {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            assert_frame(decoder.flush().unwrap(), 0);
+        }
+
+        let mut decoder = setup();
+        for nal in idr {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.decode_nal(slices[4]).unwrap().unwrap(), 0);
+        for nal in [sps, pps, &unrelated_sps, &unrelated_pps] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        for nal in &slices[5..8] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.decode_nal(slices[8]).unwrap().unwrap(), 1);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 1);
+        for nal in &slices[9..12] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+
+        assert!(decoder.decode_nal(&replacement_sps).unwrap().is_none());
+        assert_frame(decoder.decode_nal(slices[12]).unwrap().unwrap(), 2);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 1);
+        for nal in &slices[13..16] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert_frame(decoder.flush().unwrap(), 3);
+        assert_eq!(decoder.dpb.short_term_ref_list(false, false).len(), 2);
+    }
+
+    fn multislice_fixture<'a, 'b>(
+        nals: &'a [NalUnit<'b>],
+    ) -> (&'a NalUnit<'b>, &'a NalUnit<'b>, Vec<&'a NalUnit<'b>>) {
+        let sps = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Sps)
+            .unwrap();
+        let pps = nals
+            .iter()
+            .find(|n| n.nal_unit_type == NalUnitType::Pps)
+            .unwrap();
+        let slices = nals
+            .iter()
+            .filter(|n| matches!(n.nal_unit_type, NalUnitType::SliceIdr | NalUnitType::Slice))
+            .collect();
+        (sps, pps, slices)
+    }
+
+    #[test]
+    fn test_multislice_incomplete_picture_at_flush_and_boundary() {
+        for (stream, expected) in [
+            (
+                &include_bytes!("../testdata/ms_cavlc_p_test.h264")[..],
+                &include_bytes!("../testdata/ms_cavlc_p_test.yuv")[..],
+            ),
+            (
+                &include_bytes!("../testdata/ms_cabac_p_test.h264")[..],
+                &include_bytes!("../testdata/ms_cabac_p_test.yuv")[..],
+            ),
+        ] {
+            let nals = parse_annex_b(stream);
+            let (sps, pps, slices) = multislice_fixture(&nals);
+            let mut decoder = Decoder::new();
+            for nal in [sps, pps, slices[0]] {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            assert!(decoder.flush().is_none());
+            assert!(decoder.dpb.short_term_ref_list(false, false).is_empty());
+
+            // Reaching the last MB is insufficient when a middle slice is missing.
+            for i in [0, 2, 3, 0, 1, 2, 3] {
+                assert!(decoder.decode_nal(slices[i]).unwrap().is_none());
+            }
+            assert!(decoder.dpb.short_term_ref_list(false, false).is_empty());
+            let frame = decoder.flush().unwrap();
+            assert_eq!((frame.width, frame.height), (64, 64));
+            let actual = [frame.y, frame.u, frame.v].concat();
+            assert_eq!(actual.as_slice(), &expected[..64 * 64 * 3 / 2]);
+        }
+    }
+
+    #[test]
+    fn test_ordered_decoder_uses_returned_picture_sps_depth() {
+        let nals = parse_annex_b(include_bytes!("../testdata/ms_cabac_b_test.h264"));
+        let (sps, pps, slices) = multislice_fixture(&nals);
+        // Same picture syntax as the fixture SPS, with a zero-reorder VUI.
+        let zero_depth = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[
+                0x4d, 0x40, 0x0a, 0xec, 0xa2, 0x13, 0x40, 0x3f, 0x96,
+            ]),
+        };
+        for (old_sps, new_sps, output_count) in [(sps, &zero_depth, 0), (&zero_depth, sps, 1)] {
+            let mut decoder = OrderedDecoder::new();
+            for nal in [old_sps, pps]
+                .into_iter()
+                .chain(slices[..4].iter().copied())
+            {
+                assert!(decoder.decode_nal(nal).unwrap().is_empty());
+            }
+            assert!(decoder.decode_nal(new_sps).unwrap().is_empty());
+            assert_eq!(decoder.decode_nal(slices[4]).unwrap().len(), output_count);
+            // Parameter sets alone cannot drain the picture already in the queue.
+            for nal in [&zero_depth, pps] {
+                assert!(decoder.decode_nal(nal).unwrap().is_empty());
+            }
+            assert_eq!(decoder.flush().len(), 1 - output_count);
+        }
+    }
+
+    #[test]
+    fn test_multislice_sps_replacement_refreshes_inherited_scaling() {
+        let nals = parse_annex_b(include_bytes!("../testdata/ms_cavlc_p_test.h264"));
+        let (sps, pps, slices) = multislice_fixture(&nals);
+        // Same slice syntax, with High-profile SPS default scaling matrices.
+        let scaled = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x64, 0x40, 0x0a, 0xad, 0x00, 0xb4, 0x21, 0x32]),
+        };
+        let decode = |parameter_sets: &[&NalUnit<'_>]| {
+            let mut decoder = Decoder::new();
+            for nal in parameter_sets.iter().chain(&slices[..4]) {
+                assert!(decoder.decode_nal(nal).unwrap().is_none());
+            }
+            let frame = decoder.flush().unwrap();
+            [frame.y, frame.u, frame.v]
+        };
+        let original = decode(&[sps, pps]);
+        let fresh = decode(&[&scaled, pps]);
+        assert_ne!(original, fresh);
+
+        let mut decoder = Decoder::new();
+        for nal in [sps, pps].iter().chain(&slices[..4]) {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        assert!(decoder.decode_nal(&scaled).unwrap().is_none());
+        let previous = decoder.decode_nal(slices[0]).unwrap().unwrap();
+        assert_eq!([previous.y, previous.u, previous.v], original);
+        for nal in &slices[1..4] {
+            assert!(decoder.decode_nal(nal).unwrap().is_none());
+        }
+        let refreshed = decoder.flush().unwrap();
+        assert_eq!([refreshed.y, refreshed.u, refreshed.v], fresh);
+    }
+
+    #[test]
+    fn test_rejects_unsupported_sps_bit_depth() {
+        // High-profile SPS with bit_depth_luma_minus8 set to one.
+        let sps = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x64, 0x00, 0x0a, 0xa5, 0x2d, 0x88, 0x4c, 0x80]),
+        };
+        assert!(matches!(
+            Decoder::new().decode_nal(&sps),
+            Err(DecodeError::Unsupported("only 8-bit H.264 is supported"))
+        ));
+    }
+
+    #[test]
+    fn test_mbaff_cropped_picture_uses_coded_geometry() {
+        let nals = parse_annex_b(include_bytes!("../testdata/mbaff_deblock_cavlc_test.h264"));
+        let expected = include_bytes!("../testdata/mbaff_deblock_cavlc_test.yuv");
+        // Keep the coded 64x64 raster and crop 18 right and 20 bottom pixels.
+        let cropped = NalUnit {
+            nal_unit_type: NalUnitType::Sps,
+            nal_ref_idc: 3,
+            rbsp: std::borrow::Cow::Borrowed(&[0x4d, 0x40, 0x15, 0xf4, 0x22, 0x78, 0xa9, 0x90]),
+        };
+        let mut decoder = Decoder::new();
+        let mut frames = Vec::new();
+        for nal in &nals {
+            let nal = if nal.nal_unit_type == NalUnitType::Sps {
+                &cropped
+            } else {
+                nal
+            };
+            frames.extend(decoder.decode_nal(nal).unwrap());
+        }
+        frames.extend(decoder.flush());
+        frames.sort_by_key(|frame| frame.pic_order_cnt);
+        let reference = expected.chunks_exact(64 * 64 * 3 / 2);
+        assert_eq!(frames.len(), reference.len());
+        for (frame, reference) in frames.into_iter().zip(reference) {
+            assert_eq!((frame.width, frame.height), (46, 44));
+            let (y, chroma) = reference.split_at(64 * 64);
+            let (u, v) = chroma.split_at(32 * 32);
+            for (plane, reference, stride, width, height) in [
+                (frame.y, y, 64, 46, 44),
+                (frame.u, u, 32, 23, 22),
+                (frame.v, v, 32, 23, 22),
+            ] {
+                let rows = reference.chunks_exact(stride).take(height);
+                assert_eq!(plane.len(), width * height);
+                for (actual, expected) in plane.chunks_exact(width).zip(rows) {
+                    assert_eq!(actual, &expected[..width]);
+                }
+            }
+        }
     }
 
     #[test]

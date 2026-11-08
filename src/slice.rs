@@ -90,8 +90,16 @@ pub struct RefWeight {
 
 impl SliceHeader {
     pub fn qp_y(&self, pps: &Pps) -> i32 {
-        26 + pps.pic_init_qp_minus26 + self.slice_qp_delta
+        (26i64 + i64::from(pps.pic_init_qp_minus26) + i64::from(self.slice_qp_delta)) as i32
     }
+}
+
+fn read_pred_weight_value(reader: &mut BitstreamReader) -> Result<i32, &'static str> {
+    let value = reader.read_se()?;
+    if !(-128..=127).contains(&value) {
+        return Err("prediction weight or offset out of range");
+    }
+    Ok(value)
 }
 
 /// Parse a slice header from RBSP data. Returns the header and a reader
@@ -173,6 +181,10 @@ pub fn parse_slice_header(
         }
     }
 
+    if num_ref_idx_l0_active > 32 || num_ref_idx_l1_active > 32 {
+        return Err("slice reference count out of range");
+    }
+
     // ref_pic_list_modification (spec 7.3.3.1)
     let mut ref_list_mod_l0 = Vec::new();
     let mut ref_list_mod_l1 = Vec::new();
@@ -226,14 +238,14 @@ pub fn parse_slice_header(
             };
             let luma_weight_flag = r.read_bit()? != 0;
             if luma_weight_flag {
-                rw.luma_weight = r.read_se()?;
-                rw.luma_offset = r.read_se()?;
+                rw.luma_weight = read_pred_weight_value(&mut r)?;
+                rw.luma_offset = read_pred_weight_value(&mut r)?;
             }
             let chroma_weight_flag = r.read_bit()? != 0;
             if chroma_weight_flag {
                 for j in 0..2 {
-                    rw.chroma_weight[j] = r.read_se()?;
-                    rw.chroma_offset[j] = r.read_se()?;
+                    rw.chroma_weight[j] = read_pred_weight_value(&mut r)?;
+                    rw.chroma_offset[j] = read_pred_weight_value(&mut r)?;
                 }
             }
             l0.push(rw);
@@ -250,14 +262,14 @@ pub fn parse_slice_header(
                 };
                 let luma_weight_flag = r.read_bit()? != 0;
                 if luma_weight_flag {
-                    rw.luma_weight = r.read_se()?;
-                    rw.luma_offset = r.read_se()?;
+                    rw.luma_weight = read_pred_weight_value(&mut r)?;
+                    rw.luma_offset = read_pred_weight_value(&mut r)?;
                 }
                 let chroma_weight_flag = r.read_bit()? != 0;
                 if chroma_weight_flag {
                     for j in 0..2 {
-                        rw.chroma_weight[j] = r.read_se()?;
-                        rw.chroma_offset[j] = r.read_se()?;
+                        rw.chroma_weight[j] = read_pred_weight_value(&mut r)?;
+                        rw.chroma_offset[j] = read_pred_weight_value(&mut r)?;
                     }
                 }
                 l1.push(rw);
@@ -337,15 +349,28 @@ pub fn parse_slice_header(
     };
 
     let slice_qp_delta = r.read_se()?;
+    let qp_y = 26i64 + i64::from(pps.pic_init_qp_minus26) + i64::from(slice_qp_delta);
+    let qp_bd_offset = 6 * i64::from(sps.bit_depth_luma_minus8);
+    if !(-qp_bd_offset..=51).contains(&qp_y) || i32::try_from(qp_y).is_err() {
+        return Err("slice QP out of range");
+    }
 
     let mut disable_deblocking_filter_idc = 0;
     let mut slice_alpha_c0_offset_div2 = 0;
     let mut slice_beta_offset_div2 = 0;
     if pps.deblocking_filter_control_present_flag {
         disable_deblocking_filter_idc = r.read_ue()?;
+        if disable_deblocking_filter_idc > 2 {
+            return Err("disable_deblocking_filter_idc out of range");
+        }
         if disable_deblocking_filter_idc != 1 {
             slice_alpha_c0_offset_div2 = r.read_se()?;
             slice_beta_offset_div2 = r.read_se()?;
+            if !(-6..=6).contains(&slice_alpha_c0_offset_div2)
+                || !(-6..=6).contains(&slice_beta_offset_div2)
+            {
+                return Err("slice deblocking offsets out of range");
+            }
         }
     }
 
@@ -386,6 +411,22 @@ mod tests {
     use crate::nal::{parse_annex_b, NalUnitType};
     use crate::pps::parse_pps;
     use crate::sps::parse_sps;
+
+    #[test]
+    fn test_slice_header_explicit_weight_bounds() {
+        let sps = parse_sps(&[0x4d, 0x40, 0x0a, 0xdb, 0x10, 0x99]).unwrap();
+        let pps = parse_pps(&[0xcf, 0x32, 0xe8], Some(&sps)).unwrap();
+        // These P slices differ only in their explicit L0 luma weight.
+        let valid = [0xe2, 0x70, 0x1f, 0xd5, 0x40];
+        let overflow = [0xe2, 0x70, 0, 0, 0, 0x10, 0, 0, 0, 0x15, 0x40];
+
+        let (header, _) = parse_slice_header(&valid, &sps, &pps, NalUnitType::Slice, 0).unwrap();
+        assert_eq!(header.weight_table.unwrap().l0[0].luma_weight, 127);
+        assert!(matches!(
+            parse_slice_header(&overflow, &sps, &pps, NalUnitType::Slice, 0),
+            Err("prediction weight or offset out of range")
+        ));
+    }
 
     #[test]
     fn test_parse_slice_header_idr() {

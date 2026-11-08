@@ -82,7 +82,7 @@ impl Dpb {
         }
     }
 
-    /// Update capacity when a new SPS is parsed.
+    /// Update capacity for the picture about to enter the buffer.
     pub fn set_max_ref_frames(&mut self, max_ref_frames: u32) {
         self.max_ref_frames = max_ref_frames as usize;
     }
@@ -116,6 +116,27 @@ impl Dpb {
         }
         self.entries.push(DpbEntry { pic, reference });
         self.remove_unused();
+    }
+
+    /// Return the total retained picture vector capacity in bytes.
+    pub(crate) fn picture_memory(&self) -> Option<usize> {
+        fn add_capacity<T>(total: usize, data: &Vec<T>) -> Option<usize> {
+            total.checked_add(data.capacity().checked_mul(std::mem::size_of::<T>())?)
+        }
+
+        let mut bytes = 0usize;
+        for entry in &self.entries {
+            let pic = &entry.pic;
+            bytes = add_capacity(bytes, &pic.y)?;
+            bytes = add_capacity(bytes, &pic.u)?;
+            bytes = add_capacity(bytes, &pic.v)?;
+            bytes = add_capacity(bytes, &pic.mv_l0)?;
+            bytes = add_capacity(bytes, &pic.mv_l1)?;
+            bytes = add_capacity(bytes, &pic.ref_idx_l0)?;
+            bytes = add_capacity(bytes, &pic.ref_idx_l1)?;
+            bytes = add_capacity(bytes, &pic.ref_poc_l0)?;
+        }
+        Some(bytes)
     }
 
     /// Get the list of short-term reference pictures, sorted by descending PicNum.
@@ -432,6 +453,14 @@ impl Dpb {
         Ok(())
     }
 
+    pub(crate) fn poc_state(&self) -> (i32, u32) {
+        (self.prev_poc_msb, self.prev_poc_lsb)
+    }
+
+    pub(crate) fn restore_poc_state(&mut self, state: (i32, u32)) {
+        (self.prev_poc_msb, self.prev_poc_lsb) = state;
+    }
+
     /// Compute Picture Order Count for the current picture (spec 8.2.1).
     pub fn compute_poc(
         &mut self,
@@ -512,7 +541,11 @@ impl Dpb {
         }
 
         let num_ref_frames_in_cycle = sps.num_ref_frames_in_pic_order_cnt_cycle as usize;
-        let expected_delta_per_cycle: i32 = sps.offset_for_ref_frame.iter().sum();
+        let expected_delta_per_cycle = sps
+            .offset_for_ref_frame
+            .iter()
+            .copied()
+            .fold(0i32, i32::wrapping_add);
 
         let abs_frame_num = if num_ref_frames_in_cycle > 0 {
             header.frame_num as i32
@@ -545,7 +578,7 @@ impl Dpb {
             0
         };
 
-        let top_field_order_cnt = expected_poc + header.delta_pic_order_cnt[0];
+        let top_field_order_cnt = expected_poc.wrapping_add(header.delta_pic_order_cnt[0]);
         if header.field_pic_flag {
             // Field picture: POC is just this field's order count
             if header.bottom_field_flag {

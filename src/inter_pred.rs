@@ -8,13 +8,25 @@ use crate::dpb::DecodedPicture;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-/// Fetch a luma sample from the reference picture with boundary clipping.
-/// Out-of-bounds coordinates are clamped to the picture edge (spec 8.4.2.2.1).
+struct LumaRef<'a> {
+    samples: &'a [u8],
+    width: i32,
+    height: i32,
+    stride: usize,
+    zero_fill_missing: bool,
+}
+
+/// Fetch a luma sample with coordinates clamped to the logical picture edge.
 #[inline]
-fn ref_luma(pic: &DecodedPicture, x: i32, y: i32) -> i32 {
-    let cx = x.clamp(0, pic.width as i32 - 1) as usize;
-    let cy = y.clamp(0, pic.height as i32 - 1) as usize;
-    pic.y[cy * pic.width as usize + cx] as i32
+fn ref_luma(pic: &LumaRef<'_>, x: i32, y: i32) -> i32 {
+    let cx = x.clamp(0, pic.width - 1) as usize;
+    let cy = y.clamp(0, pic.height - 1) as usize;
+    let index = cy * pic.stride + cx;
+    if pic.zero_fill_missing {
+        pic.samples.get(index).copied().unwrap_or(0) as i32
+    } else {
+        pic.samples[index] as i32
+    }
 }
 
 /// Fetch a chroma sample with boundary clipping.
@@ -58,20 +70,20 @@ fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
 
 /// 6-tap horizontal half-pel filter at integer position (x, y).
 /// Returns clipped u8 result. Used only for boundary blocks.
-fn half_pel_h(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_h(pic: &LumaRef<'_>, x: i32, y: i32) -> u8 {
     let s = |dx: i32| ref_luma(pic, x + dx, y);
     clip_u8((s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3) + 16) >> 5)
 }
 
 /// 6-tap vertical half-pel filter at integer position (x, y).
 /// Used only for boundary blocks.
-fn half_pel_v(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_v(pic: &LumaRef<'_>, x: i32, y: i32) -> u8 {
     let s = |dy: i32| ref_luma(pic, x, y + dy);
     clip_u8((s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3) + 16) >> 5)
 }
 
 /// Diagonal half-pel. Used only for boundary blocks.
-fn half_pel_hv(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
+fn half_pel_hv(pic: &LumaRef<'_>, x: i32, y: i32) -> u8 {
     let mut h = [0i32; 6];
     for (i, dy) in (-2..=3).enumerate() {
         let s = |dx: i32| ref_luma(pic, x + dx, y + dy);
@@ -82,7 +94,7 @@ fn half_pel_hv(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
 }
 
 /// Per-pixel interpolation fallback for boundary blocks.
-fn luma_interp(pic: &DecodedPicture, x: i32, y: i32, frac_x: i32, frac_y: i32) -> u8 {
+fn luma_interp(pic: &LumaRef<'_>, x: i32, y: i32, frac_x: i32, frac_y: i32) -> u8 {
     match (frac_x, frac_y) {
         (0, 0) => ref_luma(pic, x, y) as u8,
         (2, 0) => half_pel_h(pic, x, y),
@@ -434,55 +446,20 @@ pub fn luma_mc_stride(
             frac_y,
             output,
         );
-    } else if ref_y_offset > 0 || stride != ref_pic.width as usize {
-        // Field-coded boundary fallback: extract field lines into a temporary
-        // DecodedPicture and use the standard interpolation on it.
-        let field_h = pic_h as usize;
-        let field_w = pic_w as usize;
-        let mut field_buf = vec![0u8; field_w * field_h];
-        for r in 0..field_h {
-            let src_off = ref_y_offset + r * stride;
-            let dst_off = r * field_w;
-            for c in 0..field_w {
-                if src_off + c < ref_pic.y.len() {
-                    field_buf[dst_off + c] = ref_pic.y[src_off + c];
-                }
-            }
-        }
-        let field_pic = DecodedPicture {
-            y: field_buf,
-            u: vec![],
-            v: vec![],
-            width: field_w as u32,
-            height: field_h as u32,
-            pic_order_cnt: 0,
-            frame_num: 0,
-            mv_l0: vec![],
-            ref_idx_l0: vec![],
-            ref_poc_l0: vec![],
-            mv_l1: vec![],
-            ref_idx_l1: vec![],
-            mb_width: 0,
-            is_intra: false,
-            structure: crate::dpb::PictureStructure::Frame,
+    } else {
+        // Clamp in logical picture coordinates before indexing the strided plane.
+        let pic = LumaRef {
+            samples: ref_y,
+            width: pic_w,
+            height: pic_h,
+            stride,
+            // Missing samples in a strided or offset view are zero-filled.
+            zero_fill_missing: ref_y_offset > 0 || stride != ref_pic.width as usize,
         };
         for row in 0..block_h {
             for col in 0..block_w {
                 output[row * block_w + col] = luma_interp(
-                    &field_pic,
-                    x_int + col as i32,
-                    y_int + row as i32,
-                    frac_x,
-                    frac_y,
-                );
-            }
-        }
-    } else {
-        // Boundary fallback: per-pixel with clamping
-        for row in 0..block_h {
-            for col in 0..block_w {
-                output[row * block_w + col] = luma_interp(
-                    ref_pic,
+                    &pic,
                     x_int + col as i32,
                     y_int + row as i32,
                     frac_x,
@@ -1200,6 +1177,64 @@ mod tests {
                     "frac ({},{}) should give 100 for uniform ref",
                     frac_x, frac_y
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_luma_mc_field_reference_equivalence() {
+        let width = 24;
+        let height = 33;
+        let field_height = height / 2;
+        let frame: Vec<u8> = (0..width * height)
+            .map(|i| ((i * 37 + (i / width) * 13 + i * i) & 255) as u8)
+            .collect();
+        let positions = [(-2, 5), (23, 5), (5, -2), (5, 15), (-2, -2), (23, 15), (6, 6)];
+
+        for (parity, len) in [
+            (0, frame.len()),
+            (1, frame.len()),
+            (0, 28 * width + 7),
+            (1, 31 * width + 7),
+        ] {
+            let samples = &frame[..len];
+            let reference = make_ref_pic(width as u32, height as u32, samples.to_vec());
+
+            // Legacy reference layout: copy only the selected field's rows, padding
+            // any missing samples with zero before running contiguous luma MC.
+            let mut packed = vec![0; width * field_height];
+            for (dst, src) in packed
+                .chunks_mut(width)
+                .zip(samples.chunks(width).skip(parity).step_by(2))
+            {
+                dst[..src.len()].copy_from_slice(src);
+            }
+            let packed = make_ref_pic(width as u32, field_height as u32, packed);
+
+            for (x, y) in positions {
+                for dy in -4..0 {
+                    for dx in -4..0 {
+                        let mut actual = [0xA5; 36];
+                        let mut expected = actual;
+                        luma_mc_stride(
+                            &reference,
+                            x,
+                            y,
+                            dx,
+                            dy,
+                            8,
+                            4,
+                            &mut actual,
+                            2 * width,
+                            parity * width,
+                        );
+                        luma_mc_stride(&packed, x, y, dx, dy, 8, 4, &mut expected, width, 0);
+                        assert_eq!(
+                            actual, expected,
+                            "field parity {parity}, plane length {len}, origin ({x}, {y}), MV ({dx}, {dy})"
+                        );
+                    }
+                }
             }
         }
     }

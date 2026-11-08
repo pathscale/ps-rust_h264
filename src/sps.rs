@@ -22,7 +22,7 @@ pub const DEFAULT_SCALING_4X4_INTER: [u8; 16] = [
 pub const FLAT_SCALING_4X4: [u8; 16] = [16; 16];
 
 /// Sequence Parameter Set (H.264 spec section 7.3.2.1).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Sps {
     pub profile_idc: u8,
     pub constraint_set0_flag: bool,
@@ -126,10 +126,7 @@ impl Sps {
         } else {
             0
         };
-        self.pic_width_in_mbs_minus1
-            .saturating_add(1)
-            .saturating_mul(16)
-            .saturating_sub(crop_x)
+        self.coded_width().saturating_sub(crop_x)
     }
 
     /// Height in pixels (accounting for cropping).
@@ -141,11 +138,19 @@ impl Sps {
         } else {
             0
         };
-        self.pic_height_in_map_units_minus1
+        self.coded_height().saturating_sub(crop_y)
+    }
+
+    pub(crate) fn coded_width(&self) -> u32 {
+        self.pic_width_in_mbs_minus1
             .saturating_add(1)
             .saturating_mul(16)
-            .saturating_mul(if self.frame_mbs_only_flag { 1 } else { 2 })
-            .saturating_sub(crop_y)
+    }
+
+    pub(crate) fn coded_height(&self) -> u32 {
+        self.pic_height_in_map_units_minus1
+            .saturating_add(1)
+            .saturating_mul(if self.frame_mbs_only_flag { 16 } else { 32 })
     }
 
     fn crop_unit_x(&self) -> u32 {
@@ -193,6 +198,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
     let _reserved_zero_2bits = r.read_bits(2)?;
     let level_idc = r.read_bits(8)? as u8;
     let seq_parameter_set_id = r.read_ue()?;
+    if seq_parameter_set_id > 31 {
+        return Err("SPS id out of range");
+    }
 
     let mut chroma_format_idc = 1; // default
     let mut separate_colour_plane_flag = false;
@@ -241,6 +249,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
 
     let log2_max_frame_num_minus4 = r.read_ue()?;
     let pic_order_cnt_type = r.read_ue()?;
+    if log2_max_frame_num_minus4 > 12 || pic_order_cnt_type > 2 {
+        return Err("SPS frame number width or POC type out of range");
+    }
 
     let mut log2_max_pic_order_cnt_lsb_minus4 = 0;
     let mut delta_pic_order_always_zero_flag = false;
@@ -251,11 +262,17 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
 
     if pic_order_cnt_type == 0 {
         log2_max_pic_order_cnt_lsb_minus4 = r.read_ue()?;
+        if log2_max_pic_order_cnt_lsb_minus4 > 12 {
+            return Err("SPS POC width out of range");
+        }
     } else if pic_order_cnt_type == 1 {
         delta_pic_order_always_zero_flag = r.read_bit()? != 0;
         offset_for_non_ref_pic = r.read_se()?;
         offset_for_top_to_bottom_field = r.read_se()?;
         num_ref_frames_in_pic_order_cnt_cycle = r.read_ue()?;
+        if num_ref_frames_in_pic_order_cnt_cycle > 255 {
+            return Err("SPS POC cycle length out of range");
+        }
         for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
             offset_for_ref_frame.push(r.read_se()?);
         }

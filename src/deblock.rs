@@ -578,7 +578,7 @@ fn refs_and_mvs_match(
 /// Returns true if |mv_a - mv_b| >= 4 in either component (quarter-pel).
 #[inline]
 fn mv_diff_ge4(mv_a: [i16; 2], mv_b: [i16; 2]) -> bool {
-    (mv_a[0] - mv_b[0]).unsigned_abs() >= 4 || (mv_a[1] - mv_b[1]).unsigned_abs() >= 4
+    mv_a[0].abs_diff(mv_b[0]) >= 4 || mv_a[1].abs_diff(mv_b[1]) >= 4
 }
 
 /// Filter one 4-sample segment of a vertical edge.
@@ -905,6 +905,21 @@ fn strong_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deblock_boundary_strength_with_extreme_motion_vectors() {
+        let p = MbInfo {
+            mb_type: MbType::Inter,
+            list_count: 1,
+            mv_l0: [[i16::MIN, 0]; 16],
+            ..MbInfo::default()
+        };
+        let mut q = p.clone();
+        q.mv_l0[0][0] = i16::MIN + 3;
+        assert_eq!(derive_bs(&p, &q, 0, 0, true), 0);
+        q.mv_l0[0][0] = i16::MAX;
+        assert_eq!(derive_bs(&p, &q, 0, 0, true), 1);
+    }
 
     #[test]
     fn test_should_filter() {

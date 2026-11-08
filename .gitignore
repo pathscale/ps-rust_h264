@@ -1,4 +1,6 @@
 /target
+/Cargo.lock
+/fuzz/Cargo.lock
 
 TODO.md
 

@@ -118,6 +118,27 @@ impl Dpb {
         self.remove_unused();
     }
 
+    /// Return the total retained picture vector capacity in bytes.
+    pub(crate) fn picture_memory(&self) -> Option<usize> {
+        fn add_capacity<T>(total: usize, data: &Vec<T>) -> Option<usize> {
+            total.checked_add(data.capacity().checked_mul(std::mem::size_of::<T>())?)
+        }
+
+        let mut bytes = 0usize;
+        for entry in &self.entries {
+            let pic = &entry.pic;
+            bytes = add_capacity(bytes, &pic.y)?;
+            bytes = add_capacity(bytes, &pic.u)?;
+            bytes = add_capacity(bytes, &pic.v)?;
+            bytes = add_capacity(bytes, &pic.mv_l0)?;
+            bytes = add_capacity(bytes, &pic.mv_l1)?;
+            bytes = add_capacity(bytes, &pic.ref_idx_l0)?;
+            bytes = add_capacity(bytes, &pic.ref_idx_l1)?;
+            bytes = add_capacity(bytes, &pic.ref_poc_l0)?;
+        }
+        Some(bytes)
+    }
+
     /// Get the list of short-term reference pictures, sorted by descending PicNum.
     /// Used to build ref_pic_list_0 for P slices (spec 8.2.4.2.1 / 8.2.4.2.5).
     ///

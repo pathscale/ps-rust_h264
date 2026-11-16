@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+### Changed (breaking)
+- The crate is now `#![no_std]` (it uses `alloc`). The minimum supported Rust
+  version is 1.81.
+- Picture working buffers and retained references share a memory budget,
+  768 MiB by default. Exceeding it returns
+  `DecodeError::Unsupported("picture memory budget exceeded")` and clears the
+  pending picture, staged field and reference buffer.
+- SPS with a luma or chroma bit depth other than 8 are rejected with
+  `DecodeError::Unsupported`.
+- Out-of-range PPS fields (parameter set IDs, default reference counts,
+  initial QP/QS, chroma QP offsets) and out-of-range slice data
+  (`first_mb_in_slice`, `mb_skip_run`, `mb_qp_delta`, motion vector
+  differences) now return errors instead of being decoded.
+- A picture whose slices end without covering every macroblock is dropped
+  instead of being returned with undecoded areas, and is not used as a
+  reference.
+- Continuation slices must use the same SPS/PPS revision and picture
+  parameters as the first slice of the picture.
+- `OrderedDecoder` takes its reorder depth from the SPS of each returned
+  picture, and parameter-set NALs no longer release buffered frames.
+
+### Added
+- `Decoder::with_picture_memory_limit` and `OrderedDecoder::with_limits` to
+  set the picture memory budget.
+- `Decoder::dropped_incomplete_pictures` and
+  `OrderedDecoder::dropped_incomplete_pictures` to count dropped incomplete
+  pictures.
+
 ## [0.4.0] - 2026-04-19
 
 ### Added

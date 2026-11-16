@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::dpb::{DecodedPicture, Dpb};
 use crate::error::DecodeError;

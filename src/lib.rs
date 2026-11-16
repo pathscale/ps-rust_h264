@@ -48,12 +48,32 @@
 //! counter **after** the call, not before. See `examples/dump_frames.rs` and
 //! `examples/play.rs` for working patterns.
 //!
+//! # Limits
+//!
+//! Picture working buffers and retained reference pictures share a memory
+//! budget of 768 MiB by default. A slice whose picture would exceed it fails
+//! with `DecodeError::Unsupported("picture memory budget exceeded")`, so the
+//! default bounds the largest stream that decodes. Use
+//! [`decoder::Decoder::with_picture_memory_limit`] or
+//! [`decoder::OrderedDecoder::with_limits`] to choose another budget.
+//!
+//! A picture whose slices end without covering every macroblock (for example
+//! after a slice was lost) is dropped instead of returned and is not used as
+//! a reference. [`decoder::Decoder::dropped_incomplete_pictures`] counts these
+//! drops.
+//!
 //! # Not supported
 //!
 //! - Interlaced coding (MBAFF, field pictures)
 //! - High 10 / 4:2:2 / 4:4:4 profiles (>8-bit, non-4:2:0 chroma)
 //! - SP/SI slice types
 //! - Slice groups / FMO
+
+#![no_std]
+extern crate alloc;
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 #[allow(dead_code)]
 mod bitstream;

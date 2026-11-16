@@ -1,4 +1,49 @@
-use std::sync::OnceLock;
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+struct OnceVec<T> {
+    ptr: AtomicPtr<Vec<T>>,
+}
+
+// SAFETY: the pointee is built by one thread and read through `&[T]` by many,
+// and a losing initializer drops its own `Vec<T>` on its own thread, so `T`
+// must be both `Send` and `Sync`.
+unsafe impl<T: Send + Sync> Sync for OnceVec<T> {}
+
+impl<T> OnceVec<T> {
+    const fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    fn get_or_init(&self, f: impl FnOnce() -> Vec<T>) -> &[T] {
+        let mut p = self.ptr.load(Ordering::Acquire);
+        if p.is_null() {
+            let boxed = Box::into_raw(Box::new(f()));
+            match self.ptr.compare_exchange(
+                core::ptr::null_mut(),
+                boxed,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => p = boxed,
+                Err(existing) => {
+                    // SAFETY: `boxed` came from `Box::into_raw` above and the
+                    // failed exchange means it was never published.
+                    unsafe { drop(Box::from_raw(boxed)) };
+                    p = existing;
+                }
+            }
+        }
+        // SAFETY: `p` is non-null here. It is either our published box or the
+        // one another thread published with Release; it is never freed or
+        // replaced once set, so the borrow is valid for `&self`.
+        unsafe { &*p }
+    }
+}
 
 use crate::bitstream::BitstreamReader;
 
@@ -290,19 +335,19 @@ fn u8_lut_lookup(r: &mut BitstreamReader, lut: &[U8Entry], bits: u8) -> Result<u
 }
 
 // Lazily-initialized lookup tables for each VLC table variant.
-static LUT_COEFF_NC0: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 16 bits → 64 KiB
-static LUT_COEFF_NC2: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 14 bits → 16 KiB
-static LUT_COEFF_NC4: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); // 10 bits →  1 KiB
-static LUT_COEFF_CHROMA_DC: OnceLock<Vec<CoeffEntry>> = OnceLock::new(); //  8 bits → 256 B
+static LUT_COEFF_NC0: OnceVec<CoeffEntry> = OnceVec::new(); // 16 bits → 64 KiB
+static LUT_COEFF_NC2: OnceVec<CoeffEntry> = OnceVec::new(); // 14 bits → 16 KiB
+static LUT_COEFF_NC4: OnceVec<CoeffEntry> = OnceVec::new(); // 10 bits →  1 KiB
+static LUT_COEFF_CHROMA_DC: OnceVec<CoeffEntry> = OnceVec::new(); //  8 bits → 256 B
 
 #[allow(clippy::declare_interior_mutable_const)]
-const INIT_U8_LOCK: OnceLock<Vec<U8Entry>> = OnceLock::new();
+const INIT_U8_LOCK: OnceVec<U8Entry> = OnceVec::new();
 #[allow(clippy::borrow_interior_mutable_const)]
-static LUT_TOTAL_ZEROS: [OnceLock<Vec<U8Entry>>; 15] = [INIT_U8_LOCK; 15];
+static LUT_TOTAL_ZEROS: [OnceVec<U8Entry>; 15] = [INIT_U8_LOCK; 15];
 #[allow(clippy::borrow_interior_mutable_const)]
-static LUT_TOTAL_ZEROS_CHROMA: [OnceLock<Vec<U8Entry>>; 3] = [INIT_U8_LOCK; 3];
+static LUT_TOTAL_ZEROS_CHROMA: [OnceVec<U8Entry>; 3] = [INIT_U8_LOCK; 3];
 #[allow(clippy::borrow_interior_mutable_const)]
-static LUT_RUN_BEFORE: [OnceLock<Vec<U8Entry>>; 7] = [INIT_U8_LOCK; 7];
+static LUT_RUN_BEFORE: [OnceVec<U8Entry>; 7] = [INIT_U8_LOCK; 7];
 
 // ============================================================
 // coeff_token VLC tables from H.264 Table 9-5

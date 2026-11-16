@@ -134,6 +134,22 @@ for frame in decoder.flush() {
 `lengthSizeMinusOne + 1` field. The AVCC NAL payload is identical to Annex B
 (same NAL header, same RBSP, same emulation prevention handling).
 
+### Limits
+
+- **Memory budget:** picture working buffers and retained reference pictures
+  share a budget of 768 MiB by default. A slice whose picture would exceed it
+  fails with `DecodeError::Unsupported("picture memory budget exceeded")`, so
+  the default bounds the largest stream that decodes. Choose another budget
+  with `Decoder::with_picture_memory_limit(bytes)` or
+  `OrderedDecoder::with_limits(max_depth, bytes)`.
+- **Incomplete pictures:** a picture whose slices end without covering every
+  macroblock (for example after a slice was lost in transport) is dropped
+  instead of returned and is not used as a reference, so following P/B
+  pictures that predict from it may also fail. `dropped_incomplete_pictures()`
+  on either decoder counts these drops.
+- **Bit depth:** only 8-bit SPS are accepted; other bit depths return
+  `DecodeError::Unsupported`.
+
 ## Tools
 
 ### Player

@@ -1,6 +1,6 @@
 //! Error type returned by the decoder.
 
-use std::fmt;
+use core::fmt;
 
 /// Errors produced by the H.264 decoder.
 ///
@@ -33,7 +33,7 @@ impl fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
 /// Allow `?` to convert `&'static str` errors from internal parsing functions
 /// into `DecodeError` automatically.
